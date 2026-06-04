@@ -1,0 +1,46 @@
+[package]
+name = "mini-agent"
+version = "0.1.0"
+edition = "2021"
+authors = ["Mini Agent Team"]
+description = "A minimal but powerful AI agent with multi-layer memory, MCP support, and self-managing skills"
+rust-version = "1.75"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[profile.release-minimal]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# HTTP client with rustls for static musl builds
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+# Storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+
+# Utils
+uuid = { version = "1.7", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
+
+# Error handling
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Logging (minimal)
+log = "0.4"
+env_logger = "0.11"

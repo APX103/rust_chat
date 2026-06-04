@@ -1,0 +1,17 @@
+[Unit]
+Description=Mini-Agent — AI assistant with multi-layer memory
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mini-agent
+Restart=on-failure
+RestartSec=5
+Environment="RUST_LOG=info"
+Environment="HOME=/root"
+
+# For local models (Ollama) without API key
+# Environment="OPENAI_API_KEY="
+
+[Install]
+WantedBy=multi-user.target

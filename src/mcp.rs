@@ -1,0 +1,484 @@
+//! MCP (Model Context Protocol) client for mini-agent.
+//!
+//! Supports stdio and HTTP/SSE transports.
+//! Lightweight JSON-RPC implementation without external MCP SDK.
+
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
+
+fn http_client() -> &'static reqwest::blocking::Client {
+    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .expect("Failed to build HTTP client")
+    })
+}
+
+use crate::models::{ToolSchema, ToolSource};
+use crate::tool_registry::ToolRegistry;
+
+// ---------------------------------------------------------------------------
+// MCP JSON-RPC types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JsonRpcRequest {
+    jsonrpc: String,
+    id: u64,
+    method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JsonRpcResponse {
+    jsonrpc: String,
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<JsonRpcError>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct JsonRpcError {
+    code: i32,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct McpTool {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(rename = "inputSchema")]
+    input_schema: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ListToolsResult {
+    tools: Vec<McpTool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CallToolResult {
+    content: Vec<ToolContent>,
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ToolContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server connection
+// ---------------------------------------------------------------------------
+
+pub enum McpTransport {
+    Stdio {
+        child: Arc<Mutex<Child>>,
+        stdin: Arc<Mutex<ChildStdin>>,
+        stdout: Arc<Mutex<BufReader<ChildStdout>>>,
+    },
+    Http {
+        base_url: String,
+        headers: HashMap<String, String>,
+    },
+}
+
+pub struct McpServer {
+    name: String,
+    transport: Arc<Mutex<McpTransport>>,
+    request_id: AtomicU64,
+    timeout_secs: u64,
+}
+
+impl McpServer {
+    pub fn connect_stdio(
+        name: &str,
+        command: &str,
+        args: &[String],
+        env: &HashMap<String, String>,
+        timeout: u64,
+    ) -> Result<Self> {
+        let mut cmd = Command::new(command);
+        cmd.args(args);
+        
+        // Filtered environment (security)
+        let safe_keys: std::collections::HashSet<&str> = [
+            "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+        ].iter().cloned().collect();
+        
+        cmd.env_clear();
+        for (key, val) in std::env::vars() {
+            if safe_keys.contains(key.as_str()) || key.starts_with("XDG_") {
+                cmd.env(key, val);
+            }
+        }
+        for (key, val) in env {
+            cmd.env(key, val);
+        }
+        
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        
+        let mut child = cmd.spawn()
+            .with_context(|| format!("Failed to spawn MCP server: {} {}", command, args.join(" ")))?;
+        
+        let stdin = child.stdin.take().ok_or_else(|| anyhow!("Failed to get stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to get stdout"))?;
+        
+        let transport = McpTransport::Stdio {
+            child: Arc::new(Mutex::new(child)),
+            stdin: Arc::new(Mutex::new(stdin)),
+            stdout: Arc::new(Mutex::new(BufReader::new(stdout))),
+        };
+        
+        let server = Self {
+            name: name.to_string(),
+            transport: Arc::new(Mutex::new(transport)),
+            request_id: AtomicU64::new(1),
+            timeout_secs: timeout,
+        };
+        
+        // Initialize session
+        server.initialize()?;
+        
+        Ok(server)
+    }
+    
+    pub fn connect_http(
+        name: &str,
+        url: &str,
+        headers: &HashMap<String, String>,
+        timeout: u64,
+    ) -> Result<Self> {
+        let server = Self {
+            name: name.to_string(),
+            transport: Arc::new(Mutex::new(McpTransport::Http {
+                base_url: url.to_string(),
+                headers: headers.clone(),
+            })),
+            request_id: AtomicU64::new(1),
+            timeout_secs: timeout,
+        };
+        server.initialize()?;
+        Ok(server)
+    }
+    
+    fn initialize(&self) -> Result<()> {
+        let result = self.request("initialize", Some(json!({
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "mini-agent", "version": "0.1.0" }
+        })))?;
+        log::debug!("MCP server '{}' initialized: {:?}", self.name, result);
+        Ok(())
+    }
+    
+    fn next_id(&self) -> u64 {
+        self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+    
+    fn request(&self, method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let id = self.next_id();
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id,
+            method: method.to_string(),
+            params,
+        };
+        let req_json = serde_json::to_string(&req)?;
+        
+        let transport = self.transport.lock().unwrap();
+        match &*transport {
+            McpTransport::Stdio { stdin, stdout, .. } => {
+                // Write request
+                {
+                    let mut writer = stdin.lock().unwrap();
+                    writeln!(writer, "{}", req_json)?;
+                    writer.flush()?;
+                }
+                
+                // Read response
+                let mut reader = stdout.lock().unwrap();
+                let mut line = String::new();
+                let deadline = std::time::Instant::now() + Duration::from_secs(self.timeout_secs);
+                
+                while std::time::Instant::now() < deadline {
+                    match reader.read_line(&mut line) {
+                        Ok(0) => return Err(anyhow!("MCP server closed connection")),
+                        Ok(_) => {
+                            let trimmed = line.trim();
+                            if !trimmed.is_empty() {
+                                let resp: JsonRpcResponse = serde_json::from_str(trimmed)
+                                    .with_context(|| format!("Invalid JSON-RPC response: {}", trimmed))?;
+                                if resp.id == Some(id) {
+                                    if let Some(err) = resp.error {
+                                        return Err(anyhow!("MCP error {}: {}", err.code, err.message));
+                                    }
+                                    return Ok(resp.result.unwrap_or(serde_json::Value::Null));
+                                }
+                            }
+                            line.clear();
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                Err(anyhow!("MCP request timeout"))
+            }
+            McpTransport::Http { base_url, headers } => {
+                let url = format!("{}/message", base_url.trim_end_matches('/'));
+                let client = http_client();
+                let mut request = client.post(&url)
+                    .timeout(Duration::from_secs(self.timeout_secs))
+                    .json(&req);
+                
+                for (k, v) in headers {
+                    request = request.header(k, v);
+                }
+                
+                let resp = request.send()
+                    .with_context(|| format!("MCP HTTP request failed: {}", url))?;
+                
+                let status = resp.status();
+                if !status.is_success() {
+                    let err_text = resp.text().unwrap_or_default();
+                    return Err(anyhow!("MCP HTTP {}: {}", status, err_text));
+                }
+                
+                let resp_json: JsonRpcResponse = resp.json()
+                    .with_context(|| "Failed to parse HTTP JSON-RPC response")?;
+                
+                if let Some(err) = resp_json.error {
+                    return Err(anyhow!("MCP error {}: {}", err.code, err.message));
+                }
+                Ok(resp_json.result.unwrap_or(serde_json::Value::Null))
+            }
+        }
+    }
+    
+    pub fn list_tools(&self) -> Result<Vec<McpTool>> {
+        let result = self.request("tools/list", None)?;
+        let tools_result: ListToolsResult = serde_json::from_value(result)
+            .unwrap_or(ListToolsResult { tools: vec![] });
+        Ok(tools_result.tools)
+    }
+    
+    pub fn call_tool(&self, tool_name: &str, arguments: serde_json::Value) -> Result<String> {
+        let result = self.request("tools/call", Some(json!({
+            "name": tool_name,
+            "arguments": arguments
+        })))?;
+        
+        let call_result: CallToolResult = serde_json::from_value(result)
+            .map_err(|e| anyhow!("Failed to parse tool result: {}", e))?;
+        
+        let mut texts = vec![];
+        for content in call_result.content {
+            if content.content_type == "text" {
+                if let Some(text) = content.text {
+                    texts.push(text);
+                }
+            }
+        }
+        
+        let output = if texts.is_empty() {
+            "(empty result)".to_string()
+        } else {
+            texts.join("\n")
+        };
+        
+        if call_result.is_error {
+            Err(anyhow!("Tool error: {}", output))
+        } else {
+            Ok(output)
+        }
+    }
+    
+    pub fn shutdown(&self) -> Result<()> {
+        self.request("shutdown", None).ok();
+        
+        let transport = self.transport.lock().unwrap();
+        if let McpTransport::Stdio { child, .. } = &*transport {
+            if let Ok(mut c) = child.lock() {
+                c.kill().ok();
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP Client Manager
+// ---------------------------------------------------------------------------
+
+pub struct McpClientManager {
+    servers: Arc<Mutex<HashMap<String, Arc<McpServer>>>>,
+}
+
+impl McpClientManager {
+    pub fn new() -> Self {
+        Self {
+            servers: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    
+    pub fn connect_servers(
+        &self,
+        configs: &HashMap<String, crate::models::McpServerConfig>,
+    ) -> Result<Vec<String>> {
+        let mut tool_names = vec![];
+        
+        for (name, config) in configs {
+            if self.servers.lock().unwrap().contains_key(name) {
+                continue;
+            }
+            
+            log::info!("Connecting to MCP server: {}", name);
+            
+            let server = if let Some(cmd) = &config.command {
+                McpServer::connect_stdio(
+                    name,
+                    cmd,
+                    config.args.as_deref().unwrap_or(&[]),
+                    &config.env,
+                    config.timeout,
+                )?
+            } else if let Some(url) = &config.url {
+                let mut headers = config.env.clone();
+                headers.retain(|k, _| k.to_lowercase().starts_with("authorization") || k.to_lowercase().starts_with("x-"));
+                McpServer::connect_http(name, url, &headers, config.timeout)?
+            } else {
+                log::warn!("MCP server '{}' has no command or url", name);
+                continue;
+            };
+            
+            let server = Arc::new(server);
+            self.servers.lock().unwrap().insert(name.clone(), server.clone());
+            
+            // Discover tools
+            match server.list_tools() {
+                Ok(tools) => {
+                    for tool in tools {
+                        let prefixed_name = format!("mcp_{}_{}", sanitize_name(name), sanitize_name(&tool.name));
+                        log::info!("  Registered MCP tool: {}", prefixed_name);
+                        tool_names.push(prefixed_name.clone());
+                        
+                        // Store in registry will happen outside
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to list tools for MCP server '{}': {}", name, e);
+                }
+            }
+        }
+        
+        Ok(tool_names)
+    }
+    
+    pub fn get_server(&self, name: &str) -> Option<Arc<McpServer>> {
+        self.servers.lock().unwrap().get(name).cloned()
+    }
+    
+    pub fn shutdown_all(&self) {
+        let servers = self.servers.lock().unwrap();
+        for (name, server) in servers.iter() {
+            log::info!("Shutting down MCP server: {}", name);
+            server.shutdown().ok();
+        }
+    }
+}
+
+impl Default for McpClientManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn sanitize_name(name: &str) -> String {
+    name.to_lowercase()
+        .replace(|c: char| !c.is_alphanumeric() && c != '_', "_")
+        .replace("..", "_")
+}
+
+/// Register MCP tools into the global ToolRegistry
+pub fn register_mcp_tools(
+    registry: &ToolRegistry,
+    mcp_manager: &McpClientManager,
+    configs: &HashMap<String, crate::models::McpServerConfig>,
+) -> Result<Vec<String>> {
+    let mut all_tools = vec![];
+    
+    for (server_name, config) in configs {
+        let server = mcp_manager.get_server(server_name)
+            .ok_or_else(|| anyhow!("MCP server '{}' not connected", server_name))?;
+        
+        let tools = server.list_tools()?;
+        for tool in tools {
+            let prefixed_name = format!("mcp_{}_{}", sanitize_name(server_name), sanitize_name(&tool.name));
+            let schema = ToolSchema {
+                name: prefixed_name.clone(),
+                description: format!("[MCP:{}] {}", server_name, tool.description),
+                parameters: normalize_schema(tool.input_schema),
+            };
+            
+            let server_clone = server.clone();
+            let tool_name = tool.name.clone();
+            let handler = move |_name: &str, args: &serde_json::Value| -> anyhow::Result<String> {
+                match server_clone.call_tool(&tool_name, args.clone()) {
+                    Ok(result) => Ok(result),
+                    Err(e) => Ok(format!("{{\"error\": \"{}\"}}", e)),
+                }
+            };
+            
+            registry.register_tool(
+                schema,
+                Arc::new(handler),
+                ToolSource::Mcp { server: server_name.clone() },
+            );
+            all_tools.push(prefixed_name);
+        }
+    }
+    
+    Ok(all_tools)
+}
+
+/// Normalize MCP input schema to OpenAI-compatible format
+fn normalize_schema(schema: serde_json::Value) -> serde_json::Value {
+    let mut schema = schema;
+    if let Some(obj) = schema.as_object_mut() {
+        if !obj.contains_key("type") {
+            obj.insert("type".to_string(), json!("object"));
+        }
+        if !obj.contains_key("properties") {
+            obj.insert("properties".to_string(), json!({}));
+        }
+        // Replace $defs with definitions for broader compatibility
+        if let Some(defs) = obj.remove("$defs") {
+            obj.insert("definitions".to_string(), defs);
+        }
+    }
+    schema
+}
