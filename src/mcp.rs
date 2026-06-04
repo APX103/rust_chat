@@ -180,7 +180,11 @@ impl McpServer {
             request_id: AtomicU64::new(1),
             timeout_secs: timeout,
         };
-        server.initialize()?;
+        // For HTTP/StreamableHttp MCP servers (e.g. Zhipu), initialize may not be required.
+        // Try it, but don't fail if the server doesn't support it.
+        if let Err(e) = server.initialize() {
+            log::warn!("MCP server '{}' initialize failed (may not be required for HTTP MCP): {}", name, e);
+        }
         Ok(server)
     }
     
@@ -252,7 +256,8 @@ impl McpServer {
                 // Smart endpoint detection:
                 // - URLs ending with /mcp (StreamableHttp style, e.g. Zhipu) → use as-is
                 // - Otherwise → append /message (traditional MCP HTTP)
-                let url = if base_url.trim_end_matches('/').ends_with("/mcp") {
+                let is_streamable_http = base_url.trim_end_matches('/').ends_with("/mcp");
+                let url = if is_streamable_http {
                     base_url.trim_end_matches('/').to_string()
                 } else {
                     format!("{}/message", base_url.trim_end_matches('/'))
@@ -261,6 +266,11 @@ impl McpServer {
                 let mut request = client.post(&url)
                     .timeout(Duration::from_secs(self.timeout_secs))
                     .json(&req);
+                
+                // StreamableHttp servers (e.g. Zhipu) need this Accept header
+                if is_streamable_http {
+                    request = request.header("Accept", "application/json, text/event-stream");
+                }
                 
                 for (k, v) in headers {
                     request = request.header(k, v);
@@ -275,8 +285,19 @@ impl McpServer {
                     return Err(anyhow!("MCP HTTP {}: {}", status, err_text));
                 }
                 
-                let resp_json: JsonRpcResponse = resp.json()
-                    .with_context(|| "Failed to parse HTTP JSON-RPC response")?;
+                let resp_text = resp.text()
+                    .with_context(|| "Failed to read HTTP response body")?;
+                
+                // Parse response: may be pure JSON or SSE format
+                let json_text = if resp_text.contains("event:") {
+                    // SSE format: extract data lines
+                    parse_sse_json(&resp_text)?
+                } else {
+                    resp_text
+                };
+                
+                let resp_json: JsonRpcResponse = serde_json::from_str(&json_text)
+                    .with_context(|| format!("Failed to parse JSON-RPC response: {}", &json_text[..json_text.len().min(200)]))?;
                 
                 if let Some(err) = resp_json.error {
                     return Err(anyhow!("MCP error {}: {}", err.code, err.message));
@@ -338,6 +359,20 @@ impl McpServer {
 }
 
 // ---------------------------------------------------------------------------
+// SSE response parser for StreamableHttp MCP servers
+// ---------------------------------------------------------------------------
+
+fn parse_sse_json(text: &str) -> Result<String> {
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("data:") {
+            return Ok(trimmed[5..].trim().to_string());
+        }
+    }
+    Err(anyhow!("No data line found in SSE response"))
+}
+
+// ---------------------------------------------------------------------------
 // MCP Client Manager
 // ---------------------------------------------------------------------------
 
@@ -365,14 +400,14 @@ impl McpClientManager {
             
             log::info!("Connecting to MCP server: {}", name);
             
-            let server = if let Some(cmd) = &config.command {
+            let server_result = if let Some(cmd) = &config.command {
                 McpServer::connect_stdio(
                     name,
                     cmd,
                     config.args.as_deref().unwrap_or(&[]),
                     &config.env,
                     config.timeout,
-                )?
+                )
             } else if let Some(url) = &config.url {
                 // Prefer explicit headers; fall back to env keys that look like HTTP headers
                 let mut headers = config.headers.clone();
@@ -384,10 +419,18 @@ impl McpClientManager {
                         }
                     }
                 }
-                McpServer::connect_http(name, url, &headers, config.timeout)?
+                McpServer::connect_http(name, url, &headers, config.timeout)
             } else {
                 log::warn!("MCP server '{}' has no command or url", name);
                 continue;
+            };
+            
+            let server = match server_result {
+                Ok(s) => s,
+                Err(e) => {
+                    log::warn!("MCP server '{}' connection failed: {}", name, e);
+                    continue;
+                }
             };
             
             let server = Arc::new(server);
@@ -446,11 +489,22 @@ pub fn register_mcp_tools(
 ) -> Result<Vec<String>> {
     let mut all_tools = vec![];
     
-    for (server_name, config) in configs {
-        let server = mcp_manager.get_server(server_name)
-            .ok_or_else(|| anyhow!("MCP server '{}' not connected", server_name))?;
+    for (server_name, _config) in configs {
+        let server = match mcp_manager.get_server(server_name) {
+            Some(s) => s,
+            None => {
+                log::debug!("MCP server '{}' not connected, skipping tool registration", server_name);
+                continue;
+            }
+        };
         
-        let tools = server.list_tools()?;
+        let tools = match server.list_tools() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("Failed to list tools for MCP server '{}': {}", server_name, e);
+                continue;
+            }
+        };
         for tool in tools {
             let prefixed_name = format!("mcp_{}_{}", sanitize_name(server_name), sanitize_name(&tool.name));
             let schema = ToolSchema {
