@@ -14,7 +14,7 @@ use crate::observer::{Event, Observer, Timer};
 use crate::skill::SkillManager;
 use crate::tool_registry::ToolRegistry;
 use anyhow::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use uuid::Uuid;
 
@@ -32,6 +32,7 @@ pub struct Agent {
     pub iteration_budget: IterationBudget,
     pub budget_grace_call: bool,
     observer: Option<Arc<dyn Observer>>,
+    on_token: Option<Mutex<Box<dyn FnMut(&str) + Send>>>,
 }
 
 pub struct IterationBudget {
@@ -87,6 +88,7 @@ impl Agent {
             iteration_budget: IterationBudget::new(max_iterations),
             budget_grace_call: false,
             observer: None,
+            on_token: None,
         }
     }
 
@@ -96,6 +98,10 @@ impl Agent {
 
     pub fn set_observer(&mut self, observer: Option<Arc<dyn Observer>>) {
         self.observer = observer;
+    }
+
+    pub fn set_on_token(&mut self, f: impl FnMut(&str) + Send + 'static) {
+        self.on_token = Some(Mutex::new(Box::new(f)));
     }
 
     fn emit(&self, event: Event) {
@@ -168,11 +174,20 @@ impl Agent {
             
             let llm_start = Instant::now();
             
-            // Call LLM
-            let (assistant_msg, usage) = self.client.chat(
-                &api_messages,
-                if tools_slice.is_empty() { None } else { Some(&tools_slice) },
-            )?;
+            // Call LLM (streaming if on_token is set)
+            let (assistant_msg, usage) = if let Some(ref cb) = self.on_token {
+                let mut guard = cb.lock().unwrap();
+                self.client.chat_with_callback(
+                    &api_messages,
+                    if tools_slice.is_empty() { None } else { Some(&tools_slice) },
+                    &mut **guard,
+                )?
+            } else {
+                self.client.chat(
+                    &api_messages,
+                    if tools_slice.is_empty() { None } else { Some(&tools_slice) },
+                )?
+            };
             
             let llm_latency = llm_start.elapsed();
             

@@ -100,6 +100,8 @@ pub enum McpTransport {
     Http {
         base_url: String,
         headers: HashMap<String, String>,
+        streamable: bool,
+        session_id: Option<String>,
     },
 }
 
@@ -170,12 +172,15 @@ impl McpServer {
         url: &str,
         headers: &HashMap<String, String>,
         timeout: u64,
+        streamable: bool,
     ) -> Result<Self> {
         let server = Self {
             name: name.to_string(),
             transport: Arc::new(Mutex::new(McpTransport::Http {
                 base_url: url.to_string(),
                 headers: headers.clone(),
+                streamable,
+                session_id: None,
             })),
             request_id: AtomicU64::new(1),
             timeout_secs: timeout,
@@ -184,6 +189,11 @@ impl McpServer {
         // Try it, but don't fail if the server doesn't support it.
         if let Err(e) = server.initialize() {
             log::warn!("MCP server '{}' initialize failed (may not be required for HTTP MCP): {}", name, e);
+        } else if streamable {
+            // Streamable HTTP requires notifications/initialized after successful initialize
+            if let Err(e) = server.send_initialized() {
+                log::warn!("MCP server '{}' initialized notification failed: {}", name, e);
+            }
         }
         Ok(server)
     }
@@ -195,6 +205,47 @@ impl McpServer {
             "clientInfo": { "name": "mini-agent", "version": "0.1.0" }
         })))?;
         log::debug!("MCP server '{}' initialized: {:?}", self.name, result);
+        Ok(())
+    }
+
+    /// Send notifications/initialized (required for Streamable HTTP).
+    fn send_initialized(&self) -> Result<()> {
+        // Notifications have no id and expect no response
+        let req = JsonRpcRequest {
+            jsonrpc: "2.0".to_string(),
+            id: 0, // dummy id; we won't wait for response
+            method: "notifications/initialized".to_string(),
+            params: None,
+        };
+        let req_json = serde_json::to_string(&req)?;
+
+        let transport = self.transport.lock().unwrap();
+        if let McpTransport::Http { base_url, headers, streamable, session_id } = &*transport {
+            let url = if *streamable {
+                base_url.trim_end_matches('/').to_string()
+            } else {
+                format!("{}/message", base_url.trim_end_matches('/'))
+            };
+            let client = http_client();
+            let mut request = client.post(&url)
+                .timeout(Duration::from_secs(self.timeout_secs))
+                .body(req_json)
+                .header("Content-Type", "application/json");
+
+            if *streamable {
+                request = request.header("Accept", "application/json, text/event-stream");
+            }
+            if let Some(sid) = session_id {
+                request = request.header("Mcp-Session-Id", sid.as_str());
+            }
+            for (k, v) in headers.iter() {
+                request = request.header(k, v.as_str());
+            }
+
+            // Fire and forget — don't check response for notifications
+            let _ = request.send();
+            log::debug!("MCP server '{}' sent notifications/initialized", self.name);
+        }
         Ok(())
     }
     
@@ -212,8 +263,8 @@ impl McpServer {
         };
         let req_json = serde_json::to_string(&req)?;
         
-        let transport = self.transport.lock().unwrap();
-        match &*transport {
+        let mut transport = self.transport.lock().unwrap();
+        match &mut *transport {
             McpTransport::Stdio { stdin, stdout, .. } => {
                 // Write request
                 {
@@ -252,12 +303,8 @@ impl McpServer {
                 }
                 Err(anyhow!("MCP request timeout"))
             }
-            McpTransport::Http { base_url, headers } => {
-                // Smart endpoint detection:
-                // - URLs ending with /mcp (StreamableHttp style, e.g. Zhipu) → use as-is
-                // - Otherwise → append /message (traditional MCP HTTP)
-                let is_streamable_http = base_url.trim_end_matches('/').ends_with("/mcp");
-                let url = if is_streamable_http {
+            McpTransport::Http { base_url, headers, streamable, session_id } => {
+                let url = if *streamable {
                     base_url.trim_end_matches('/').to_string()
                 } else {
                     format!("{}/message", base_url.trim_end_matches('/'))
@@ -266,28 +313,39 @@ impl McpServer {
                 let mut request = client.post(&url)
                     .timeout(Duration::from_secs(self.timeout_secs))
                     .json(&req);
-                
-                // StreamableHttp servers (e.g. Zhipu) need this Accept header
-                if is_streamable_http {
+
+                if *streamable {
                     request = request.header("Accept", "application/json, text/event-stream");
                 }
-                
-                for (k, v) in headers {
-                    request = request.header(k, v);
+                if let Some(sid) = session_id {
+                    request = request.header("Mcp-Session-Id", sid.as_str());
                 }
-                
+                for (k, v) in headers.iter() {
+                    request = request.header(k, v.as_str());
+                }
+
                 let resp = request.send()
                     .with_context(|| format!("MCP HTTP request failed: {}", url))?;
-                
+
+                // Capture session id from response headers before consuming body
+                let new_session_id = resp.headers().get("Mcp-Session-Id")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
                 let status = resp.status();
                 if !status.is_success() {
                     let err_text = resp.text().unwrap_or_default();
                     return Err(anyhow!("MCP HTTP {}: {}", status, err_text));
                 }
-                
+
                 let resp_text = resp.text()
                     .with_context(|| "Failed to read HTTP response body")?;
-                
+
+                // Update session id if server returned one
+                if let Some(sid) = new_session_id {
+                    *session_id = Some(sid);
+                }
+
                 // Parse response: may be pure JSON or SSE format
                 let json_text = if resp_text.contains("event:") {
                     // SSE format: extract data lines
@@ -295,10 +353,10 @@ impl McpServer {
                 } else {
                     resp_text
                 };
-                
+
                 let resp_json: JsonRpcResponse = serde_json::from_str(&json_text)
                     .with_context(|| format!("Failed to parse JSON-RPC response: {}", &json_text[..json_text.len().min(200)]))?;
-                
+
                 if let Some(err) = resp_json.error {
                     return Err(anyhow!("MCP error {}: {}", err.code, err.message));
                 }
@@ -419,7 +477,7 @@ impl McpClientManager {
                         }
                     }
                 }
-                McpServer::connect_http(name, url, &headers, config.timeout)
+                McpServer::connect_http(name, url, &headers, config.timeout, config.is_streamable_http())
             } else {
                 log::warn!("MCP server '{}' has no command or url", name);
                 continue;
@@ -515,10 +573,18 @@ pub fn register_mcp_tools(
             
             let server_clone = server.clone();
             let tool_name = tool.name.clone();
+            let server_name_clone = server_name.clone();
             let handler = move |_name: &str, args: &serde_json::Value| -> anyhow::Result<String> {
+                log::debug!("MCP tool call: {}::{} args={}", server_name_clone, tool_name, args);
                 match server_clone.call_tool(&tool_name, args.clone()) {
-                    Ok(result) => Ok(result),
-                    Err(e) => Ok(format!("{{\"error\": \"{}\"}}", e)),
+                    Ok(result) => {
+                        log::debug!("MCP tool result: {}::{} len={} result={}", server_name_clone, tool_name, result.len(), &result[..result.len().min(500)]);
+                        Ok(result)
+                    }
+                    Err(e) => {
+                        log::warn!("MCP tool error: {}::{} error={}", server_name_clone, tool_name, e);
+                        Ok(format!("{{\"error\": \"{}\"}}", e))
+                    }
                 }
             };
             

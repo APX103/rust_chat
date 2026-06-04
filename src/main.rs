@@ -27,9 +27,10 @@ use identity::{default_identity, Identity};
 use llm::LlmClient;
 use memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
 use mcp::{McpClientManager, register_mcp_tools};
-use observer::{LogObserver, NoopObserver, Observer};
+use observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
 use skill::{SkillManager, get_skill_tools, handle_skill_manage, handle_skill_view, handle_skills_list};
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tool_registry::ToolRegistry;
 
@@ -185,12 +186,12 @@ fn run(config_override: Option<String>) -> anyhow::Result<()> {
     .with_extra_headers(cfg.model.extra_headers)
     .with_timeout(cfg.model.timeout);
     
-    // Initialize observer
+    // Initialize observer (terminal + log combined)
     let observer: Arc<dyn Observer> = if cfg.observer.enabled {
-        match cfg.observer.kind.as_str() {
-            "none" => Arc::new(NoopObserver),
-            _ => Arc::new(LogObserver),
-        }
+        let mut multi = MultiObserver::new(vec![]);
+        multi.push(Arc::new(LogObserver));
+        multi.push(Arc::new(TerminalObserver));
+        Arc::new(multi)
     } else {
         Arc::new(NoopObserver)
     };
@@ -248,10 +249,25 @@ fn run(config_override: Option<String>) -> anyhow::Result<()> {
             }
         }
         
-        // Normal conversation
+        // Normal conversation with streaming
+        let mut spinner = Spinner::start("Thinking...");
+        let spinner_flag = spinner.running();
+        
+        agent.set_on_token(move |token| {
+            spinner_flag.store(false, Ordering::Relaxed);
+            print!("{}", token);
+            io::stdout().flush().unwrap();
+        });
+        
         match agent.chat(input) {
-            Ok(response) => println!("\n🤖 Agent: {}", response),
-            Err(e) => eprintln!("Error: {}", e),
+            Ok(_response) => {
+                spinner.stop();
+                println!(); // newline after stream
+            }
+            Err(e) => {
+                spinner.stop();
+                eprintln!("Error: {}", e);
+            }
         }
     }
     
@@ -558,4 +574,72 @@ fn run_setup_wizard() -> anyhow::Result<()> {
     println!("   Run `mini-agent` to start chatting.");
     
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Spinner — animated waiting indicator
+// ---------------------------------------------------------------------------
+
+struct Spinner {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn start(message: &str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let r = running.clone();
+        let msg = message.to_string();
+        let handle = std::thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while r.load(Ordering::Relaxed) {
+                eprint!("\r{} {} ", frames[i % frames.len()], msg);
+                std::io::stderr().flush().ok();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                i += 1;
+            }
+            eprint!("\r{:width$}\r", "", width = msg.len() + 4);
+            std::io::stderr().flush().ok();
+        });
+        Self { running, handle: Some(handle) }
+    }
+
+    fn running(&self) -> Arc<AtomicBool> {
+        self.running.clone()
+    }
+
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TerminalObserver — prints tool calls to stdout
+// ---------------------------------------------------------------------------
+
+struct TerminalObserver;
+
+impl Observer for TerminalObserver {
+    fn on_event(&self, event: Event) {
+        match event {
+            Event::ToolCall { name, args } => {
+                println!("\n🔧 Calling tool: {}({})", name, args);
+            }
+            Event::ToolResult { name, success, duration, .. } => {
+                let icon = if success { "✅" } else { "❌" };
+                println!("{} Tool {} finished in {:?}", icon, name, duration);
+            }
+            _ => {}
+        }
+    }
 }

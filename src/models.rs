@@ -294,6 +294,15 @@ pub struct McpServerConfig {
     pub timeout: u64,
     #[serde(default = "default_mcp_connect_timeout")]
     pub connect_timeout: u64,
+    /// MCP transport type: "stdio" | "http" | "streamable-http" (default: inferred from command/url)
+    #[serde(default, rename = "type")]
+    pub transport_type: String,
+}
+
+impl McpServerConfig {
+    pub fn is_streamable_http(&self) -> bool {
+        self.transport_type.eq_ignore_ascii_case("streamable-http")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
