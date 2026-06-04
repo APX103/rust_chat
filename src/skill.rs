@@ -338,12 +338,12 @@ mod walkdir {
     
     impl IntoIterator for WalkDir {
         type Item = Result<DirEntry, std::io::Error>;
-        type IntoIter = Vec<Self::Item>;
+        type IntoIter = std::vec::IntoIter<Self::Item>;
         
         fn into_iter(self) -> Self::IntoIter {
             let mut results = vec![];
             walk(Path::new(&self.root), 0, self.max_depth, &mut results);
-            results
+            results.into_iter()
         }
     }
     

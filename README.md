@@ -94,10 +94,28 @@ ldd target/aarch64-unknown-linux-musl/release/mini-agent
 
 ## Configuration
 
-Create `~/.mini-agent/config.toml`:
+Config search order (first match wins):
+1. `./.mini-agent/config.toml` — project-local, current directory
+2. `~/.mini-agent/config.toml` — global, user home directory
+3. `--config <path>` — CLI override
+
+When a local config exists, data directory also goes local (`./.mini-agent/data/`).
+
+### Quick Setup
+
+```bash
+# Interactive wizard (creates config at first match location)
+./mini-agent --setup
+
+# Or create manually in current directory (best for development)
+mkdir .mini-agent
+cp config.example.toml .mini-agent/config.toml
+# edit .mini-agent/config.toml
+```
+
+### Config File Example
 
 ```toml
-# OpenAI
 [model]
 provider = "openai"
 model = "gpt-4o-mini"
@@ -106,25 +124,21 @@ base_url = "https://api.openai.com/v1"
 max_tokens = 4096
 temperature = 0.7
 
-# OpenRouter (聚合多种模型)
-# [model]
-# provider = "openrouter"
-# model = "anthropic/claude-3.5-sonnet"
-# api_key = "sk-or-v1-..."
-# base_url = "https://openrouter.ai/api/v1"
-# extra_headers = { HTTP-Referer = "https://your-app.com", X-Title = "Mini-Agent" }
-
-# 本地 Ollama / vLLM (无需 API Key)
-# [model]
-# provider = "ollama"
-# model = "qwen2.5:14b"
-# api_key = ""
-# base_url = "http://localhost:11434/v1"
-
 [memory]
 enabled = true
+provider = "builtin"
 semantic_search_top_k = 5
 episodic_summary_threshold = 10
+hybrid_search = true
+
+[observer]
+enabled = true
+kind = "log"
+
+[heartbeat]
+enabled = false
+interval_secs = 3600
+tasks = ["auto_summarize", "memory_cleanup"]
 
 [agent]
 max_iterations = 30

@@ -556,7 +556,7 @@ impl MemoryProvider for BuiltinMemoryProvider {
         if *count % self.summary_threshold == 0 {
             if let Ok(turns) = self.db.get_recent_turns(self.summary_threshold) {
                 let summary = format_summary(&turns);
-                let range = format!("turns {}-{}", count - self.summary_threshold + 1, count);
+                let range = format!("turns {}-{}", *count - self.summary_threshold + 1, *count);
                 self.db.save_episodic_summary(&summary, &range).ok();
             }
         }

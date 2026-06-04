@@ -1,23 +1,56 @@
 //! Configuration management for mini-agent.
 //!
-//! Reads from `~/.mini-agent/config.toml` and merges with defaults.
+//! Config search order (first match wins):
+//!   1. ./.mini-agent/config.toml      (project-local, current dir)
+//!   2. ~/.mini-agent/config.toml      (global, user home)
+//!   3. --config <path>                (CLI override, highest priority)
+//!
+//! When a local config exists, data directory also goes local:
+//!   ./.mini-agent/data/  instead of  ~/.mini-agent/data/
 
 use crate::models::AgentConfig;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub const APP_NAME: &str = "mini-agent";
+const CONFIG_FILENAME: &str = "config.toml";
 
-pub fn get_config_dir() -> PathBuf {
+/// Get the global config dir (~/.mini-agent or %USERPROFILE%\.mini-agent)
+pub fn get_global_config_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(format!(".{}", APP_NAME))
 }
 
+/// Check if a local project config exists in current directory.
+pub fn has_local_config() -> bool {
+    PathBuf::from(format!(".{}", APP_NAME))
+        .join(CONFIG_FILENAME)
+        .exists()
+}
+
+/// Get the active config directory.
+/// If ./.mini-agent/config.toml exists, use ./.mini-agent/;
+/// otherwise fall back to ~/.mini-agent/
+pub fn get_config_dir() -> PathBuf {
+    if has_local_config() {
+        PathBuf::from(format!(".{}", APP_NAME))
+    } else {
+        get_global_config_dir()
+    }
+}
+
+/// Get the active config file path (searches local first, then global).
 pub fn get_config_path() -> PathBuf {
-    get_config_dir().join("config.toml")
+    // Check current directory first
+    let local = PathBuf::from(format!(".{}", APP_NAME)).join(CONFIG_FILENAME);
+    if local.exists() {
+        return local;
+    }
+    // Fall back to global
+    get_global_config_dir().join(CONFIG_FILENAME)
 }
 
 pub fn get_data_dir() -> PathBuf {
@@ -33,16 +66,18 @@ pub fn get_identity_path() -> PathBuf {
 }
 
 pub fn load_config() -> Result<AgentConfig> {
-    let config_path = get_config_path();
-    
-    if config_path.exists() {
-        let contents = fs::read_to_string(&config_path)
-            .with_context(|| format!("Failed to read config: {}", config_path.display()))?;
+    load_config_from(&get_config_path())
+}
+
+pub fn load_config_from(path: &Path) -> Result<AgentConfig> {
+    if path.exists() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config: {}", path.display()))?;
         let config: AgentConfig = toml::from_str(&contents)
-            .with_context(|| "Failed to parse config TOML")?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse config TOML from {}: {}", path.display(), e))?;
         Ok(config)
     } else {
-        log::warn!("Config not found at {}, using defaults", config_path.display());
+        log::warn!("Config not found at {}, using defaults", path.display());
         Ok(default_config())
     }
 }

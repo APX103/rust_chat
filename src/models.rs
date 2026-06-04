@@ -127,11 +127,30 @@ pub struct ToolResult {
 
 pub type ToolHandler = Arc<dyn Fn(&str, &serde_json::Value) -> anyhow::Result<String> + Send + Sync>;
 
-#[derive(Debug, Clone)]
 pub struct Tool {
     pub schema: ToolSchema,
     pub handler: ToolHandler,
     pub source: ToolSource,
+}
+
+impl std::fmt::Debug for Tool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tool")
+            .field("schema", &self.schema)
+            .field("source", &self.source)
+            .field("handler", &"<fn>")
+            .finish()
+    }
+}
+
+impl Clone for Tool {
+    fn clone(&self) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            handler: Arc::clone(&self.handler),
+            source: self.source.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -193,7 +212,7 @@ pub struct Usage {
 // Config types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObserverConfig {
     #[serde(default = "default_observer_enabled")]
     pub enabled: bool,
@@ -201,7 +220,7 @@ pub struct ObserverConfig {
     pub kind: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct HeartbeatConfig {
     #[serde(default = "default_heartbeat_enabled")]
     pub enabled: bool,
@@ -216,6 +235,7 @@ pub struct AgentConfig {
     pub model: ModelConfig,
     pub memory: MemoryConfig,
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    #[serde(default)]
     pub skills: SkillsConfig,
     pub agent: AgentBehaviorConfig,
     #[serde(default)]
@@ -268,6 +288,8 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
     #[serde(default = "default_mcp_timeout")]
     pub timeout: u64,
     #[serde(default = "default_mcp_connect_timeout")]

@@ -144,7 +144,8 @@ impl Agent {
             
             // Inject memory context into the last user message
             if let Some(last_user_idx) = api_messages.iter().rposition(|m| m.role == MessageRole::User) {
-                if let Some(mem_block) = build_memory_context_block(&memory_context).strip() {
+                let mem_block = build_memory_context_block(&memory_context);
+                if !mem_block.is_empty() {
                     if let Some(content) = &api_messages[last_user_idx].content {
                         api_messages[last_user_idx].content = Some(format!("{}\n\n{}", content, mem_block));
                     }

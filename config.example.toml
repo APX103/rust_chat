@@ -3,7 +3,7 @@
 
 [model]
 provider = "openai"
-model = "glm-5-turbo"
+model = "gpt-4o-mini"
 api_key = "sk-your-key-here"
 base_url = "https://api.openai.com/v1"
 max_tokens = 4096
@@ -50,6 +50,12 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 timeout = 30
 
 # HTTP-based MCP server example
-# [mcp_server.remote_api]
+# [mcp_servers.remote_api]
 # url = "https://mcp.example.com/mcp"
 # timeout = 60
+
+# 智谱 AI 联网搜索 MCP (https://docs.bigmodel.cn/cn/coding-plan/mcp/search-mcp-server)
+# [mcp_servers.web-search]
+# url = "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp"
+# headers = { Authorization = "Bearer your-zhipu-api-key" }
+# timeout = 30

@@ -1,5 +1,12 @@
-[target.aarch64-unknown-linux-musl]
-linker = "aarch64-linux-gnu-gcc"
-
-[build]
-target = "aarch64-unknown-linux-musl"
+# Windows native compilation (default)
+# No global target override — cargo builds for x86_64-pc-windows-msvc by default.
+#
+# For ARM64 musl cross-compile, explicitly pass the target:
+#   cargo build --release --target aarch64-unknown-linux-musl
+#
+# Or temporarily uncomment below for a session:
+# [build]
+# target = "aarch64-unknown-linux-musl"
+#
+# [target.aarch64-unknown-linux-musl]
+# linker = "aarch64-linux-gnu-gcc"

@@ -21,7 +21,7 @@ mod skill;
 mod tool_registry;
 
 use agent::{Agent, build_system_prompt};
-use config::{ensure_dirs, get_data_dir, get_skills_dir, load_config, write_default_config};
+use config::{ensure_dirs, get_data_dir, get_skills_dir, load_config, load_config_from, write_default_config, write_default_identity};
 use heartbeat::Heartbeat;
 use identity::{default_identity, Identity};
 use llm::LlmClient;
@@ -39,9 +39,10 @@ fn main() {
     env_logger::init();
     
     let args: Vec<String> = std::env::args().collect();
-    
-    if args.len() > 1 {
-        match args[1].as_str() {
+    let mut config_override: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
             "--version" | "-v" => {
                 println!("mini-agent {}", VERSION);
                 return;
@@ -57,8 +58,18 @@ fn main() {
                 }
                 return;
             }
+            "--config" | "-c" => {
+                if i + 1 < args.len() {
+                    config_override = Some(args[i + 1].clone());
+                    i += 1;
+                } else {
+                    eprintln!("Error: --config requires a path argument");
+                    std::process::exit(1);
+                }
+            }
             _ => {}
         }
+        i += 1;
     }
     
     println!("╔══════════════════════════════════════╗");
@@ -67,7 +78,7 @@ fn main() {
     println!("╚══════════════════════════════════════╝");
     println!();
     
-    if let Err(e) = run() {
+    if let Err(e) = run(config_override) {
         eprintln!("Fatal error: {}", e);
         std::process::exit(1);
     }
@@ -79,17 +90,18 @@ fn print_help() {
     println!("Usage: mini-agent [OPTIONS]");
     println!();
     println!("Options:");
-    println!("  -h, --help       Print this help message");
-    println!("  -v, --version    Print version information");
-    println!("  --setup          Run interactive setup wizard");
+    println!("  -h, --help            Print this help message");
+    println!("  -v, --version         Print version information");
+    println!("  -c, --config <PATH>   Use specific config file");
+    println!("  --setup               Run interactive setup wizard");
     println!();
     println!("Environment:");
-    println!("  OPENAI_API_KEY   Default API key for OpenAI provider");
+    println!("  OPENAI_API_KEY        Default API key for OpenAI provider");
     println!();
     println!("Config directory: {}", config::get_config_dir().display());
 }
 
-fn run() -> anyhow::Result<()> {
+fn run(config_override: Option<String>) -> anyhow::Result<()> {
     // Setup directories
     ensure_dirs()?;
     write_default_config()?;
@@ -105,7 +117,13 @@ fn run() -> anyhow::Result<()> {
     };
     
     // Load config
-    let cfg = load_config()?;
+    let cfg = if let Some(path) = config_override {
+        let p = std::path::Path::new(&path);
+        log::info!("Using config override: {}", p.display());
+        load_config_from(p)?
+    } else {
+        load_config()?
+    };
     
     // Initialize SQLite memory
     let db_path = get_data_dir().join("memory.db");

@@ -249,7 +249,14 @@ impl McpServer {
                 Err(anyhow!("MCP request timeout"))
             }
             McpTransport::Http { base_url, headers } => {
-                let url = format!("{}/message", base_url.trim_end_matches('/'));
+                // Smart endpoint detection:
+                // - URLs ending with /mcp (StreamableHttp style, e.g. Zhipu) → use as-is
+                // - Otherwise → append /message (traditional MCP HTTP)
+                let url = if base_url.trim_end_matches('/').ends_with("/mcp") {
+                    base_url.trim_end_matches('/').to_string()
+                } else {
+                    format!("{}/message", base_url.trim_end_matches('/'))
+                };
                 let client = http_client();
                 let mut request = client.post(&url)
                     .timeout(Duration::from_secs(self.timeout_secs))
@@ -367,8 +374,16 @@ impl McpClientManager {
                     config.timeout,
                 )?
             } else if let Some(url) = &config.url {
-                let mut headers = config.env.clone();
-                headers.retain(|k, _| k.to_lowercase().starts_with("authorization") || k.to_lowercase().starts_with("x-"));
+                // Prefer explicit headers; fall back to env keys that look like HTTP headers
+                let mut headers = config.headers.clone();
+                if headers.is_empty() {
+                    for (k, v) in &config.env {
+                        let kl = k.to_lowercase();
+                        if kl.starts_with("authorization") || kl.starts_with("x-") {
+                            headers.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
                 McpServer::connect_http(name, url, &headers, config.timeout)?
             } else {
                 log::warn!("MCP server '{}' has no command or url", name);
