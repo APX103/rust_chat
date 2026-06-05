@@ -117,7 +117,7 @@ fn main() {
                     _ => tool_result("Unknown tool", true),
                 };
 
-                respond_raw(&mut stdout, &result);
+                respond(&mut stdout, &id, result);
             }
             _ => {}
         }
@@ -130,14 +130,9 @@ fn respond(out: &mut impl Write, id: &Value, result: Value) {
     out.flush().ok();
 }
 
-fn tool_result(text: &str, is_error: bool) -> String {
+fn tool_result(text: &str, is_error: bool) -> Value {
     json!({
         "content": [{"type": "text", "text": text}],
         "isError": is_error
-    }).to_string()
-}
-
-fn respond_raw(out: &mut impl Write, msg: &str) {
-    writeln!(out, "{}", msg).ok();
-    out.flush().ok();
+    })
 }
