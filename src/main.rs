@@ -291,12 +291,18 @@ fn handle_slash(input: &str, skill_manager: &SkillManager, agent: &mut Agent) ->
             println!("Commands:");
             println!("  /quit, /q       Exit");
             println!("  /help, /h       Show this help");
+            println!("  /new            Start a new session");
             println!("  /skills         List available skills");
             println!("  /memory         Show memory status");
             println!("  /clear          Clear conversation history");
             println!("  /model <name>   Switch model");
             println!("");
             println!("Invoke a skill: /skill-name");
+        }
+        "/new" => {
+            let old_session = agent.session_id[..8].to_string();
+            agent.new_session();
+            println!("🆕 New session started. Old: {}..., New: {}...", old_session, &agent.session_id[..8]);
         }
         "/skills" => {
             match handle_skills_list(skill_manager) {

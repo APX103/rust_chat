@@ -363,6 +363,21 @@ impl Agent {
             session_id: self.session_id.clone(),
         });
     }
+
+    /// Start a new session: end current one, reset state, emit start.
+    pub fn new_session(&mut self) {
+        self.emit_session_end();
+        self.memory.on_session_end(&self.session_id);
+
+        self.session_id = Uuid::new_v4().to_string();
+        self.conversation_history.clear();
+        self.turn_count = 0;
+        self.api_call_count = 0;
+        self.iteration_budget = IterationBudget::new(self.iteration_budget.max_total);
+        self.budget_grace_call = false;
+
+        self.emit_session_start();
+    }
 }
 
 /// Build the system prompt for the agent
