@@ -21,6 +21,18 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Profile for remote debugging on ARM64 Linux (e.g. Arduino UNO Q)
+# - Keeps debug symbols (no strip)
+# - Unwinds on panic so you get full backtraces
+# - Optimized but debuggable
+[profile.debug-remote]
+inherits = "release"
+strip = false
+panic = "unwind"
+debug = true
+lto = false
+codegen-units = 16
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

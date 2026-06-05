@@ -39,23 +39,33 @@ tasks = ["auto_summarize", "memory_cleanup"]
 # MCP Servers — tools will be auto-discovered and registered
 [mcp_servers]
 
-[mcp_servers.time]
-command = "uvx"
-args = ["mcp-server-time"]
-timeout = 30
+# ═══════════════════════════════════════════════════════════════
+# 以下 stdio-based MCP 需要本地安装 uvx / npx / node 等工具链。
+# 在 Arduino UNO Q 等无外接工具链的嵌入式 Linux 环境上，
+# 请注释掉或删除这些配置，只保留 HTTP-based MCP。
+# ═══════════════════════════════════════════════════════════════
+# [mcp_servers.time]
+# command = "uvx"
+# args = ["mcp-server-time"]
+# timeout = 30
 
-[mcp_servers.filesystem]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-timeout = 30
+# [mcp_servers.filesystem]
+# command = "npx"
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# timeout = 30
 
-# HTTP-based MCP server example
+# ═══════════════════════════════════════════════════════════════
+# HTTP-based / Streamable HTTP MCP 不需要本地安装任何工具，
+# 只要板子能联网就能直接用，推荐用于嵌入式部署。
+# ═══════════════════════════════════════════════════════════════
 # [mcp_servers.remote_api]
 # url = "https://mcp.example.com/mcp"
+# type = "streamable-http"
 # timeout = 60
 
 # 智谱 AI 联网搜索 MCP (https://docs.bigmodel.cn/cn/coding-plan/mcp/search-mcp-server)
 # [mcp_servers.web-search]
 # url = "https://open.bigmodel.cn/api/mcp/web_search_prime/mcp"
+# type = "streamable-http"
 # headers = { Authorization = "Bearer your-zhipu-api-key" }
 # timeout = 30
