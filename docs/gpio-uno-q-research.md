@@ -326,5 +326,212 @@ GPIO 全部由 STM32 MCU 控制，UNO 标准连接器（22 个引脚）映射如
 
 ---
 
+## 9. Arduino App Lab 深度调研（新增）
+
+### 9.1 App Lab 的真实架构
+
+Arduino App Lab 宣传上是"一站式开发环境"，但它的实际运行机制和直觉不太一样：
+
+| 你以为的 | 实际上的 |
+|---------|---------|
+| Python 脚本直接跑在 Debian Linux 上 | ❌ **Python 脚本跑在 Docker 容器里** |
+| `arduino.app_utils` 是系统级 Python 包 | ❌ **只在 App Lab 的容器内可用** |
+| App 是一个常驻后台服务 | ❌ **需要手动点击 Run 才会启动** |
+| 可以和系统其他进程自由通信 | ❌ **容器隔离，需要显式挂载才能访问宿主机资源** |
+
+**关键证据**（来自 Arduino 官方论坛）：
+
+> "The Python script of the App runs in a **Docker** container, isolated from the global Linux environment. So changes you make in the primary operating system's environment have no effect on the environment in which the Python script is executed, and vice versa."
+> — Arduino 官方员工 ptillisch, 2025-11
+
+### 9.2 App Lab 能做什么？
+
+**适合的场景：**
+
+1. **快速验证 Bridge RPC 通信**
+   - 在 App Lab 里同时写 Python 侧和 Sketch 侧
+   - 点击 Run，App Lab 自动编译 sketch、刷入 MCU、启动 Python
+   - 有内置 Serial Monitor，可以看 MCU 输出
+
+2. **刷入 MCU sketch**
+   - App Lab 集成了固件刷写功能，比 Arduino IDE 更方便
+   - 自动处理 MPU ↔ MCU 的通信初始化
+
+3. **原型开发**
+   - 快速测试 "Python 做 AI 推理 → MCU 控制 GPIO" 的完整链路
+   - 内置 Bricks（摄像头、Web UI、AI 模型等）可以快速搭原型
+
+**App Lab 开发流程：**
+
+```
+PC/Mac 上的 App Lab 编辑器
+    ↓ 编辑文件（实际保存在 UNO Q 的 /home/arduino/arduino_apps/）
+UNO Q 上的 App
+    ├── sketch.ino  → 编译后刷入 STM32 MCU
+    ├── main.py     → 在 Docker 容器里运行
+    └── app.yaml    → App 配置
+```
+
+### 9.3 App Lab 不能做什么？
+
+**不适合作为 mini-agent 的 GPIO 后端，原因：**
+
+| 问题 | 说明 |
+|------|------|
+| 生命周期耦合 | App Lab 的 App 需要手动启动，mini-agent 无法自动拉起 |
+| 环境隔离 | Docker 容器和 mini-agent 不在同一个进程空间 |
+| API 不可调用 | `Bridge.call()` 在容器里，mini-agent 在宿主机，无法直接调用 |
+| 端口暴露复杂 | 如果要在容器里暴露 HTTP API，需要配置端口映射 |
+| 资源开销 | 多跑一个 Docker 容器，对 2GB 版本 UNO Q 是负担 |
+
+**结论：不要把 App Lab 当作 GPIO 服务的实现方式。它只是一个开发和验证工具。**
+
+### 9.4 那 App Lab 在这个项目里的正确用法是什么？
+
+**阶段一：用 App Lab 验证通信（一次性）**
+
+1. 在 App Lab 里创建一个新 App
+2. **Sketch 侧**（刷入 MCU）：
+   ```cpp
+   #include "Arduino_RouterBridge.h"
+
+   void setup() {
+       pinMode(LED_BUILTIN, OUTPUT);
+       Bridge.begin();
+       Bridge.provide_safe("gpio_write", gpio_write);
+       Bridge.provide_safe("gpio_read", gpio_read);
+   }
+
+   void loop() {}
+
+   void gpio_write(int pin, bool value) {
+       pinMode(pin, OUTPUT);
+       digitalWrite(pin, value ? HIGH : LOW);
+   }
+
+   bool gpio_read(int pin) {
+       pinMode(pin, INPUT);
+       return digitalRead(pin) == HIGH;
+   }
+   ```
+3. **Python 侧**（测试调用）：
+   ```python
+   from arduino.app_utils import Bridge
+   import time
+
+   # 测试：让 LED 闪烁 3 次
+   for i in range(3):
+       Bridge.call("gpio_write", LED_BUILTIN, True)
+       time.sleep(0.5)
+       Bridge.call("gpio_write", LED_BUILTIN, False)
+       time.sleep(0.5)
+   ```
+4. 点击 Run，确认 LED 能正常闪烁
+5. ✅ **通信验证完成**
+
+**阶段二：脱离 App Lab，写独立服务（实际部署）**
+
+验证通后，把 sketch 固定刷入 MCU（用 Arduino IDE 或 App Lab 刷一次即可），然后在 Debian Linux 侧写一个**独立的常驻服务**：
+
+```python
+#!/usr/bin/env python3
+# gpio_service.py — 不依赖 App Lab，直接用系统 Python 运行
+
+import socket
+import msgpack
+import sys
+
+SOCKET_PATH = "/var/run/arduino-router.sock"
+
+def call_rpc(method, params):
+    """通过 Unix Socket 调用 MCU 上的 RPC 函数"""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.connect(SOCKET_PATH)
+        request = msgpack.packb([0, 1, method, params])
+        sock.sendall(request)
+        response_data = sock.recv(1024)
+        response = msgpack.unpackb(response_data)
+        # response format: [type=1, msgid, error, result]
+        return response[3] if len(response) > 3 else None
+
+def gpio_write(pin, value):
+    call_rpc("gpio_write", [pin, value])
+
+def gpio_read(pin):
+    return call_rpc("gpio_read", [pin])
+
+if __name__ == "__main__":
+    # 命令行测试
+    if len(sys.argv) >= 3 and sys.argv[1] == "write":
+        gpio_write(int(sys.argv[2]), sys.argv[3] == "1")
+    elif len(sys.argv) >= 2 and sys.argv[1] == "read":
+        print(gpio_read(int(sys.argv[2])))
+```
+
+这个脚本可以直接在 SSH 里运行，不需要 App Lab：
+
+```bash
+ssh arduino@uno-q-ip
+sudo apt install python3-msgpack
+python3 gpio_service.py write 13 1   # 点亮 D13 LED
+python3 gpio_service.py read 13      # 读取 D13 状态
+```
+
+### 9.5 最终推荐架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  macOS 开发机                                                │
+│  ├── 交叉编译 mini-agent (cargo zigbuild)                     │
+│  └── VS Code 远程调试                                         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │ scp
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Arduino UNO Q (Debian Linux)                                │
+│  │                                                           │
+│  ├── mini-agent (Rust 二进制)                                │
+│  │   └── 内置 gpio 工具 ──► Unix Socket                     │
+│  │                           │                               │
+│  │   ┌───────────────────────┘                               │
+│  │   ▼                                                       │
+│  ├── arduino-router (后台服务)                               │
+│  │   └── /var/run/arduino-router.sock                       │
+│  │       │                                                   │
+│  │   ┌───┘                                                   │
+│  │   ▼                                                       │
+│  └── /dev/ttyHS1 ◄─────串────► Serial1 (STM32 MCU)          │
+│                                                           │
+│  ┌─────────────────────────────────────────────────────────┐│
+│  │  Arduino App Lab（仅用于开发验证，不跑在 production）     ││
+│  │  └── 临时测试 Bridge 通信、刷 sketch                      ││
+│  └─────────────────────────────────────────────────────────┘│
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.6 关键依赖清单（UNO Q 上需要装的）
+
+| 组件 | 安装命令 | 用途 |
+|------|---------|------|
+| `arduino-router` | 预装 | MPU ↔ MCU 通信路由 |
+| `python3-msgpack` | `sudo apt install python3-msgpack` | 独立 Python 脚本调用 RPC |
+| `gpiod` | `sudo apt install gpiod` | 如果 MPU 侧有 GPIO（确认没有） |
+
+> ⚠️ **注意**：不需要在 UNO Q 上安装 Arduino App Lab 本身（它预装在 eMMC 上），也不需要安装 `arduino.app_utils`（它在 App Lab 容器里）。
+
+---
+
+## 10. 调研结论
+
+| 问题 | 结论 |
+|------|------|
+| 能不能用 Arduino App Lab 实现 GPIO 服务？ | **不能**。App Lab 是开发工具，不是后台服务框架。 |
+| 那 App Lab 有什么用？ | **开发验证**：快速测试 Bridge RPC 通信、刷 sketch、看 Serial Monitor。 |
+| 实际部署选哪条路？ | **路径 A（Rust 内置）** 或 **独立 Python 脚本**。都不依赖 App Lab。 |
+| 需要自己在 UNO Q 上写什么？ | 一个常驻的轻量服务（Rust/Python），通过 Unix Socket 调用 arduino-router。 |
+| 最简可行产品（MVP）是什么？ | 1. 用 App Lab 刷好 sketch → 2. 写个 Python 脚本测试 RPC → 3. 把调用逻辑集成到 mini-agent。 |
+
+---
+
 *文档生成时间：2026-06-05*  
 *状态：未验证 — 需在实际 UNO Q 硬件上测试后更新*
