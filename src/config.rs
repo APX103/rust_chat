@@ -122,6 +122,8 @@ pub fn default_config() -> AgentConfig {
             interval_secs: 3600,
             tasks: vec!["auto_summarize".to_string(), "memory_cleanup".to_string()],
         },
+        file_memory: crate::models::FileMemoryConfig::default(),
+        compression: crate::models::CompressionConfig::default(),
         mcp_servers: std::collections::HashMap::new(),
         skills: crate::models::SkillsConfig {
             enabled: true,

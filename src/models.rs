@@ -265,6 +265,10 @@ pub struct AgentConfig {
     pub observer: ObserverConfig,
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
+    #[serde(default)]
+    pub file_memory: FileMemoryConfig,
+    #[serde(default)]
+    pub compression: CompressionConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +303,52 @@ pub struct MemoryConfig {
     pub provider: String,
     #[serde(default = "default_hybrid_search")]
     pub hybrid_search: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMemoryConfig {
+    #[serde(default = "default_file_memory_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_memory_char_limit")]
+    pub memory_char_limit: usize,
+    #[serde(default = "default_user_char_limit")]
+    pub user_char_limit: usize,
+}
+
+impl Default for FileMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            memory_char_limit: 2200,
+            user_char_limit: 1375,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressionConfig {
+    #[serde(default = "default_compression_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_compression_threshold")]
+    pub threshold_percent: f64,
+    #[serde(default = "default_compression_protect_first")]
+    pub protect_first_n: usize,
+    #[serde(default = "default_compression_protect_last")]
+    pub protect_last_n: usize,
+    #[serde(default = "default_compression_summary_ratio")]
+    pub summary_target_ratio: f64,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            threshold_percent: 0.50,
+            protect_first_n: 3,
+            protect_last_n: 20,
+            summary_target_ratio: 0.20,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -448,4 +498,36 @@ fn default_heartbeat_enabled() -> bool {
 
 fn default_heartbeat_interval() -> u64 {
     3600
+}
+
+fn default_file_memory_enabled() -> bool {
+    true
+}
+
+fn default_memory_char_limit() -> usize {
+    2200
+}
+
+fn default_user_char_limit() -> usize {
+    1375
+}
+
+fn default_compression_enabled() -> bool {
+    true
+}
+
+fn default_compression_threshold() -> f64 {
+    0.50
+}
+
+fn default_compression_protect_first() -> usize {
+    3
+}
+
+fn default_compression_protect_last() -> usize {
+    20
+}
+
+fn default_compression_summary_ratio() -> f64 {
+    0.20
 }

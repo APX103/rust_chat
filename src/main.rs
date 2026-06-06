@@ -712,6 +712,8 @@ fn run_setup_wizard() -> anyhow::Result<()> {
             interval_secs: 3600,
             tasks: vec!["auto_summarize".to_string(), "memory_cleanup".to_string()],
         },
+        file_memory: crate::models::FileMemoryConfig::default(),
+        compression: crate::models::CompressionConfig::default(),
     };
 
     let config_path = config::get_config_path();
