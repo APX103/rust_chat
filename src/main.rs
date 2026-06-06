@@ -9,39 +9,24 @@
 //!
 //! Target: ARM64 (Cortex-A57) + Debian 7 (static musl build)
 
-mod agent;
-mod compression;
-mod config;
-mod file_memory;
-mod heartbeat;
-mod hooks;
-mod identity;
-mod llm;
-mod memory;
-mod mcp;
-mod models;
-mod observer;
-mod session_search;
-mod skill;
-mod tool;
-mod tool_registry;
-
-use agent::{Agent, build_system_prompt};
-use config::{ensure_dirs, get_data_dir, get_skills_dir, load_config, load_config_from, write_default_config, write_default_identity};
-use heartbeat::Heartbeat;
-use hooks::HookRunner;
-use identity::{default_identity, Identity};
-use llm::LlmClient;
-use memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
-use mcp::{McpClientManager, register_mcp_tools};
-use crate::file_memory::{FileMemoryStore, MemoryTarget};
-use observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
-use session_search::SessionDB;
-use skill::{SkillManager, get_skill_tools, handle_skill_manage, handle_skill_view, handle_skills_list};
+// Re-exported from lib.rs — modules declared there.
+use mini_agent::agent::{Agent, build_system_prompt};
+use mini_agent::config;
+use mini_agent::config::{ensure_dirs, get_data_dir, get_skills_dir, load_config, load_config_from, write_default_config, write_default_identity};
+use mini_agent::file_memory::{FileMemoryStore, MemoryTarget};
+use mini_agent::heartbeat::Heartbeat;
+use mini_agent::hooks::HookRunner;
+use mini_agent::identity::{default_identity, Identity};
+use mini_agent::llm::LlmClient;
+use mini_agent::memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
+use mini_agent::mcp::{McpClientManager, register_mcp_tools};
+use mini_agent::observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
+use mini_agent::session_search::SessionDB;
+use mini_agent::skill::{SkillManager, get_skill_tools, handle_skill_manage, handle_skill_view, handle_skills_list};
+use mini_agent::tool_registry::ToolRegistry;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tool_registry::ToolRegistry;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -409,7 +394,7 @@ fn register_builtin_tools(
     let db_clone = db.clone();
     let file_memory_clone = file_memory.clone();
     registry.register_tool_legacy(
-        crate::models::ToolSchema {
+        mini_agent::models::ToolSchema {
             name: "memory".to_string(),
             description: "Add a fact to long-term semantic memory.".to_string(),
             parameters: serde_json::json!({
@@ -492,13 +477,13 @@ fn register_builtin_tools(
                 _ => Err(anyhow::anyhow!("Unknown memory action: {}", action))
             }
         }),
-        crate::models::ToolSource::Builtin,
+        mini_agent::models::ToolSource::Builtin,
     );
 
     // session_search tool
     let session_db_clone = session_db.clone();
     registry.register_tool_legacy(
-        crate::models::ToolSchema {
+        mini_agent::models::ToolSchema {
             name: "session_search".to_string(),
             description: "Search past conversation sessions for relevant context.".to_string(),
             parameters: serde_json::json!({
@@ -566,7 +551,7 @@ fn register_builtin_tools(
                 _ => Ok("Unknown mode. Use discover, scroll, or browse.".to_string()),
             }
         }),
-        crate::models::ToolSource::Builtin,
+        mini_agent::models::ToolSource::Builtin,
     );
 }
 
@@ -585,7 +570,7 @@ fn register_skill_tools(registry: &ToolRegistry, skill_manager: Arc<SkillManager
                     _ => Err(anyhow::anyhow!("Unknown skill tool: {}", name)),
                 }
             }),
-            crate::models::ToolSource::Builtin,
+            mini_agent::models::ToolSource::Builtin,
         );
     }
 }
@@ -607,7 +592,7 @@ impl AuditHook {
 }
 
 #[async_trait::async_trait]
-impl crate::hooks::HookHandler for AuditHook {
+impl mini_agent::hooks::HookHandler for AuditHook {
     fn name(&self) -> &str {
         &self.name
     }
@@ -782,7 +767,7 @@ fn run_setup_wizard() -> anyhow::Result<()> {
         let client = LlmClient::new(api_key.clone(), base_url.clone(), model.clone())
             .with_max_tokens(10);
         match client.chat(
-            &[crate::models::Message::user("hi")],
+            &[mini_agent::models::Message::user("hi")],
             None,
         ) {
             Ok((msg, _)) => {
@@ -810,8 +795,8 @@ fn run_setup_wizard() -> anyhow::Result<()> {
     let heartbeat_enabled = input.trim().eq_ignore_ascii_case("y");
 
     // Build config
-    let config = crate::models::AgentConfig {
-        model: crate::models::ModelConfig {
+    let config = mini_agent::models::AgentConfig {
+        model: mini_agent::models::ModelConfig {
             provider: provider.to_string(),
             model,
             api_key,
@@ -822,7 +807,7 @@ fn run_setup_wizard() -> anyhow::Result<()> {
             extra_headers: std::collections::HashMap::new(),
             timeout: 120,
         },
-        memory: crate::models::MemoryConfig {
+        memory: mini_agent::models::MemoryConfig {
             enabled: memory_enabled,
             semantic_search_top_k: 5,
             episodic_summary_threshold: 10,
@@ -830,26 +815,26 @@ fn run_setup_wizard() -> anyhow::Result<()> {
             hybrid_search: true,
         },
         mcp_servers: std::collections::HashMap::new(),
-        skills: crate::models::SkillsConfig {
+        skills: mini_agent::models::SkillsConfig {
             enabled: true,
             auto_create: true,
             external_dirs: vec![],
         },
-        agent: crate::models::AgentBehaviorConfig {
+        agent: mini_agent::models::AgentBehaviorConfig {
             max_iterations: 30,
             enable_reasoning: true,
         },
-        observer: crate::models::ObserverConfig {
+        observer: mini_agent::models::ObserverConfig {
             enabled: true,
             kind: "log".to_string(),
         },
-        heartbeat: crate::models::HeartbeatConfig {
+        heartbeat: mini_agent::models::HeartbeatConfig {
             enabled: heartbeat_enabled,
             interval_secs: 3600,
             tasks: vec!["auto_summarize".to_string(), "memory_cleanup".to_string()],
         },
-        file_memory: crate::models::FileMemoryConfig::default(),
-        compression: crate::models::CompressionConfig::default(),
+        file_memory: mini_agent::models::FileMemoryConfig::default(),
+        compression: mini_agent::models::CompressionConfig::default(),
     };
 
     let config_path = config::get_config_path();
