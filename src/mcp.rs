@@ -588,7 +588,7 @@ pub fn register_mcp_tools(
                 }
             };
             
-            registry.register_tool(
+            registry.register_tool_legacy(
                 schema,
                 Arc::new(handler),
                 ToolSource::Mcp { server: server_name.clone() },

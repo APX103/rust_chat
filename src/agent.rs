@@ -4,8 +4,10 @@
 //! - Budget-controlled iteration
 //! - Tool call validation and execution
 //! - Memory prefetch / sync
+//! - Hook system for lifecycle interception
 //! - Grace call on budget exhaustion
 
+use crate::hooks::HookRunner;
 use crate::identity::Identity;
 use crate::llm::{LlmClient, Usage};
 use crate::memory::{build_memory_context_block, MemoryManager};
@@ -13,6 +15,7 @@ use crate::models::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::observer::{Event, Observer, Timer};
 use crate::skill::SkillManager;
 use crate::tool_registry::ToolRegistry;
+use crate::tool::ToolOutput;
 use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -33,6 +36,7 @@ pub struct Agent {
     pub budget_grace_call: bool,
     observer: Option<Arc<dyn Observer>>,
     on_token: Option<Mutex<Box<dyn FnMut(&str) + Send>>>,
+    hooks: Arc<HookRunner>,
 }
 
 pub struct IterationBudget {
@@ -89,7 +93,13 @@ impl Agent {
             budget_grace_call: false,
             observer: None,
             on_token: None,
+            hooks: Arc::new(HookRunner::new()),
         }
+    }
+
+    /// Set the hook runner for lifecycle interception.
+    pub fn set_hooks(&mut self, hooks: Arc<HookRunner>) {
+        self.hooks = hooks;
     }
 
     pub fn set_system_prompt(&mut self, prompt: String) {
@@ -110,26 +120,31 @@ impl Agent {
         }
     }
 
-    pub fn run_conversation(&mut self, user_message: &str) -> Result<String> {
+    pub async fn run_conversation(&mut self, user_message: &str) -> Result<String> {
+        // Fire turn start hooks
+        self.hooks
+            .fire_turn_start(self.turn_count, user_message)
+            .await;
+
         self.emit(Event::TurnStart {
             turn_number: self.turn_count,
             user_message_preview: user_message.to_string(),
         });
 
         let mut messages: Vec<Message> = self.conversation_history.clone();
-        
+
         if messages.is_empty() && !self.system_prompt.is_empty() {
             messages.push(Message::system(&self.system_prompt));
         }
-        
+
         // Add user message
         messages.push(Message::user(user_message));
-        
+
         self.memory.on_turn_start(self.turn_count, user_message);
-        
+
         let mut final_response = String::new();
         let mut total_usage: Option<Usage> = None;
-        
+
         while (self.api_call_count < self.max_iterations && self.iteration_budget.remaining() > 0)
             || self.budget_grace_call
         {
@@ -140,14 +155,14 @@ impl Agent {
                 log::warn!("Iteration budget exhausted ({}/{})", self.iteration_budget.used, self.iteration_budget.max_total);
                 break;
             }
-            
+
             self.api_call_count += 1;
             log::info!("API call #{}/{}", self.api_call_count, self.max_iterations);
-            
+
             // Prefetch memory and inject into messages
             let memory_context = self.memory.prefetch_all(user_message, &self.session_id);
             let mut api_messages = messages.clone();
-            
+
             // Inject memory context into the last user message
             if let Some(last_user_idx) = api_messages.iter().rposition(|m| m.role == MessageRole::User) {
                 let mem_block = build_memory_context_block(&memory_context);
@@ -157,7 +172,7 @@ impl Agent {
                     }
                 }
             }
-            
+
             // Get available tools
             let tools = self.registry.list_tools();
             let tools_slice: Vec<ToolSchema> = if tools.is_empty() {
@@ -165,15 +180,15 @@ impl Agent {
             } else {
                 tools
             };
-            
+
             self.emit(Event::LlmRequest {
                 model: self.client.model().to_string(),
                 messages_count: api_messages.len(),
                 tools_count: tools_slice.len(),
             });
-            
+
             let llm_start = Instant::now();
-            
+
             // Call LLM (streaming if on_token is set)
             let (assistant_msg, usage) = if let Some(ref cb) = self.on_token {
                 let mut guard = cb.lock().unwrap();
@@ -188,9 +203,9 @@ impl Agent {
                     if tools_slice.is_empty() { None } else { Some(&tools_slice) },
                 )?
             };
-            
+
             let llm_latency = llm_start.elapsed();
-            
+
             if let Some(ref u) = usage {
                 self.emit(Event::LlmResponse {
                     model: self.client.model().to_string(),
@@ -199,7 +214,7 @@ impl Agent {
                     latency: llm_latency,
                 });
             }
-            
+
             if let Some(u) = usage {
                 total_usage = Some(Usage {
                     prompt_tokens: u.prompt_tokens + total_usage.as_ref().map(|t| t.prompt_tokens).unwrap_or(0),
@@ -207,16 +222,16 @@ impl Agent {
                     total_tokens: u.total_tokens + total_usage.as_ref().map(|t| t.total_tokens).unwrap_or(0),
                 });
             }
-            
+
             // Handle tool calls
             if let Some(tool_calls) = &assistant_msg.tool_calls {
                 if !tool_calls.is_empty() {
                     log::info!("Processing {} tool call(s)...", tool_calls.len());
-                    
+
                     // Validate tool names
                     let mut valid_tool_calls = vec![];
                     let mut invalid_tools = vec![];
-                    
+
                     for tc in tool_calls {
                         if self.registry.has_tool(&tc.function.name) {
                             valid_tool_calls.push(tc.clone());
@@ -224,12 +239,12 @@ impl Agent {
                             invalid_tools.push(tc.function.name.clone());
                         }
                     }
-                    
+
                     // Add assistant message with tool calls
                     let mut assistant_for_history = assistant_msg.clone();
                     assistant_for_history.content = assistant_for_history.content.filter(|c| !c.is_empty());
                     messages.push(assistant_for_history);
-                    
+
                     // Execute tools
                     if !invalid_tools.is_empty() {
                         log::warn!("Invalid tool calls: {:?}", invalid_tools);
@@ -243,29 +258,83 @@ impl Agent {
                             }
                         }
                     }
-                    
+
                     for tc in &valid_tool_calls {
                         let args: serde_json::Value = if tc.function.arguments.trim().is_empty() {
                             serde_json::json!({})
                         } else {
                             serde_json::from_str(&tc.function.arguments).unwrap_or_else(|_| serde_json::json!({}))
                         };
+
+                        // Fire tool_call notification hooks (parallel)
+                        self.hooks.fire_tool_call(&tc.function.name, &args).await;
+
                         self.emit(Event::ToolCall {
                             name: tc.function.name.clone(),
                             args: args.clone(),
                         });
+
                         let timer = Timer::start();
-                        let result = self.execute_tool_call(tc);
-                        let duration = timer.elapsed();
-                        match result {
-                            Ok(content) => {
+
+                        // Run before_tool_call hooks (serial, can modify or cancel)
+                        let hook_result = self.hooks
+                            .run_before_tool_call(tc.function.name.clone(), args.clone())
+                            .await;
+
+                        let (tool_name, tool_args) = match hook_result {
+                            crate::hooks::HookResult::Continue((n, a)) => (n, a),
+                            crate::hooks::HookResult::Cancel(reason) => {
+                                let err_msg = format!("Tool call cancelled by hook: {}", reason);
+                                log::warn!("{}", err_msg);
+                                let duration = timer.elapsed();
                                 self.emit(Event::ToolResult {
                                     name: tc.function.name.clone(),
-                                    success: true,
+                                    success: false,
                                     duration,
-                                    output_len: content.len(),
+                                    output_len: err_msg.len(),
                                 });
-                                messages.push(Message::tool(&tc.id, &tc.function.name, content));
+                                self.hooks.fire_tool_result(&tc.function.name, false, duration).await;
+                                messages.push(Message::tool(&tc.id, &tc.function.name, err_msg));
+                                continue;
+                            }
+                        };
+
+                        let result = self.execute_tool_call_with(&tool_name, &tool_args).await;
+
+                        let duration = timer.elapsed();
+
+                        match result {
+                            Ok(output) => {
+                                // Run after_tool_result hooks (serial, can modify output)
+                                let hook_result = self.hooks
+                                    .run_after_tool_result(tc.function.name.clone(), output.clone())
+                                    .await;
+
+                                let (final_name, final_output) = match hook_result {
+                                    crate::hooks::HookResult::Continue((n, o)) => (n, o),
+                                    crate::hooks::HookResult::Cancel(reason) => {
+                                        let err_str = format!("Tool result cancelled by hook: {}", reason);
+                                        log::warn!("{}", err_str);
+                                        self.emit(Event::ToolResult {
+                                            name: tc.function.name.clone(),
+                                            success: false,
+                                            duration,
+                                            output_len: err_str.len(),
+                                        });
+                                        self.hooks.fire_tool_result(&tc.function.name, false, duration).await;
+                                        messages.push(Message::tool(&tc.id, &tc.function.name, err_str));
+                                        continue;
+                                    }
+                                };
+
+                                self.emit(Event::ToolResult {
+                                    name: final_name.clone(),
+                                    success: final_output.success,
+                                    duration,
+                                    output_len: final_output.text.len(),
+                                });
+                                self.hooks.fire_tool_result(&final_name, final_output.success, duration).await;
+                                messages.push(Message::tool(&tc.id, &final_name, final_output.text));
                             }
                             Err(e) => {
                                 let err_str = format!("{{\"error\": \"{}\"}}", e);
@@ -275,6 +344,7 @@ impl Agent {
                                     duration,
                                     output_len: err_str.len(),
                                 });
+                                self.hooks.fire_tool_result(&tc.function.name, false, duration).await;
                                 messages.push(Message::tool(
                                     &tc.id,
                                     &tc.function.name,
@@ -283,27 +353,32 @@ impl Agent {
                             }
                         }
                     }
-                    
+
                     continue; // Loop back for next iteration
                 }
             }
-            
+
             // No tool calls — final response
             final_response = assistant_msg.content.clone().unwrap_or_default();
-            
+
             // Preserve reasoning if present
             if let Some(reasoning) = &assistant_msg.reasoning {
                 log::debug!("Reasoning: {}...", &reasoning[..reasoning.len().min(200)]);
             }
-            
+
             messages.push(assistant_msg);
             break;
         }
-        
+
+        // Fire turn end hooks
+        self.hooks
+            .fire_turn_end(self.turn_count, &final_response)
+            .await;
+
         // Sync memory
         self.memory.sync_all(user_message, &final_response, &self.session_id);
         self.turn_count += 1;
-        
+
         // Save conversation history (limit to last 50 messages to prevent bloat)
         // Preserve system prompt at the beginning if present
         const MAX_HISTORY: usize = 50;
@@ -321,35 +396,43 @@ impl Agent {
             }
         }
         self.conversation_history = messages;
-        
+
         let total_tokens = total_usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
         self.emit(Event::TurnComplete {
             turn_number: self.turn_count,
             api_calls: self.api_call_count,
             total_tokens,
         });
-        
+
         if let Some(u) = total_usage {
             log::info!("Turn complete. Tokens: prompt={}, completion={}, total={}",
                 u.prompt_tokens, u.completion_tokens, u.total_tokens);
         }
-        
+
         Ok(final_response)
     }
 
-    fn execute_tool_call(&self, tc: &ToolCall) -> Result<String> {
+    /// Execute a tool call using its ToolCall struct (async version).
+    async fn execute_tool_call(&self, tc: &ToolCall) -> Result<String> {
         let args: serde_json::Value = if tc.function.arguments.trim().is_empty() {
             serde_json::json!({})
         } else {
             serde_json::from_str(&tc.function.arguments)?
         };
-        
+
         log::info!("Executing tool: {} with args: {}", tc.function.name, args);
-        self.registry.dispatch(&tc.function.name, &args)
+        let output = self.registry.dispatch(&tc.function.name, &args).await?;
+        Ok(output.text)
     }
 
-    pub fn chat(&mut self, message: &str) -> Result<String> {
-        self.run_conversation(message)
+    /// Execute a tool by name and args (used after hook modifications).
+    async fn execute_tool_call_with(&self, name: &str, args: &serde_json::Value) -> Result<ToolOutput> {
+        log::info!("Executing tool: {} with args: {}", name, args);
+        self.registry.dispatch(name, args).await
+    }
+
+    pub async fn chat(&mut self, message: &str) -> Result<String> {
+        self.run_conversation(message).await
     }
 
     pub fn emit_session_start(&self) {
@@ -388,28 +471,28 @@ pub fn build_system_prompt(
     enable_reasoning: bool,
 ) -> Result<String> {
     let mut parts = vec![];
-    
+
     // Identity-derived base prompt
     parts.push(identity.to_system_prompt());
-    
+
     if enable_reasoning {
         parts.push("Use reasoning before tool calls when helpful. Think step by step.".to_string());
     }
-    
+
     // Add skill index
     if let Ok(skill_index) = skill_manager.build_skill_index_prompt() {
         if !skill_index.is_empty() {
             parts.push(skill_index);
         }
     }
-    
+
     // Add memory system prompt blocks
     let memory_prompt = memory_manager.prefetch_all("system_prompt", "");
     if !memory_prompt.is_empty() {
         parts.push(format!("## Memory Context\n{}", memory_prompt));
     }
-    
+
     parts.push("When you need to use a tool, respond with a tool call. Otherwise respond directly.".to_string());
-    
+
     Ok(parts.join("\n\n"))
 }

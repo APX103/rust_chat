@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
@@ -150,6 +152,27 @@ impl Clone for Tool {
             handler: Arc::clone(&self.handler),
             source: self.source.clone(),
         }
+    }
+}
+
+// Implement the new Tool trait for the legacy Tool struct.
+#[async_trait]
+impl crate::tool::Tool for Tool {
+    fn name(&self) -> &str {
+        &self.schema.name
+    }
+
+    fn description(&self) -> &str {
+        &self.schema.description
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.schema.parameters.clone()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tool::ToolOutput> {
+        let result = (self.handler)(&self.schema.name, &args)?;
+        Ok(crate::tool::ToolOutput::ok(result))
     }
 }
 

@@ -53,6 +53,12 @@ regex = "1.10"
 anyhow = "1.0"
 thiserror = "1.0"
 
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+async-trait = "0.1"
+futures-util = "0.3"
+crossbeam-channel = "0.5"
+
 # Logging (minimal)
 log = "0.4"
 env_logger = "0.11"
