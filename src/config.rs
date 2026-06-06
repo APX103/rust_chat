@@ -124,6 +124,7 @@ pub fn default_config() -> AgentConfig {
         },
         file_memory: crate::models::FileMemoryConfig::default(),
         compression: crate::models::CompressionConfig::default(),
+        review: crate::models::ReviewConfig::default(),
         mcp_servers: std::collections::HashMap::new(),
         skills: crate::models::SkillsConfig {
             enabled: true,

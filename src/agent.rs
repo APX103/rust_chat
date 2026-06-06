@@ -11,6 +11,7 @@ use crate::hooks::HookRunner;
 use crate::identity::Identity;
 use crate::llm::{LlmClient, Usage};
 use crate::memory::{build_memory_context_block, MemoryManager};
+use crate::memory_reviewer::MemoryReviewer;
 use crate::models::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::observer::{Event, Observer, Timer};
 use crate::session_search::SessionDB;
@@ -38,6 +39,7 @@ pub struct Agent {
     compression_enabled: bool,
     max_context_tokens: usize,
     session_db: Option<Arc<SessionDB>>,
+    memory_reviewer: Option<Arc<MemoryReviewer>>,
     observer: Option<Arc<dyn Observer>>,
     on_token: Option<Mutex<Box<dyn FnMut(&str) + Send>>>,
     hooks: Arc<HookRunner>,
@@ -100,6 +102,7 @@ impl Agent {
             compression_enabled,
             max_context_tokens,
             session_db: None,
+            memory_reviewer: None,
             observer: None,
             on_token: None,
             hooks: Arc::new(HookRunner::new()),
@@ -115,6 +118,10 @@ impl Agent {
         self.system_prompt = prompt;
     }
 
+    pub fn switch_model(&mut self, model: &str) {
+        self.client.set_model(model);
+    }
+
     pub fn set_observer(&mut self, observer: Option<Arc<dyn Observer>>) {
         self.observer = observer;
     }
@@ -125,6 +132,10 @@ impl Agent {
 
     pub fn set_session_db(&mut self, db: Option<Arc<SessionDB>>) {
         self.session_db = db;
+    }
+
+    pub fn set_memory_reviewer(&mut self, reviewer: Option<Arc<MemoryReviewer>>) {
+        self.memory_reviewer = reviewer;
     }
 
     fn emit(&self, event: Event) {
@@ -489,6 +500,10 @@ impl Agent {
 
     /// Start a new session: end current one, reset state, emit start.
     pub fn new_session(&mut self) {
+        if let Some(ref reviewer) = self.memory_reviewer {
+            reviewer.reset_counter();
+        }
+
         // End old session
         if let Some(ref db) = self.session_db {
             let _ = db.end_session(&self.session_id);
@@ -510,6 +525,31 @@ impl Agent {
         }
 
         self.emit_session_start();
+    }
+
+    /// Build a snapshot of recent conversation turns for review.
+    pub fn build_review_snapshot(&self, window_size: usize) -> Vec<Message> {
+        let start = self.conversation_history.len().saturating_sub(window_size);
+        self.conversation_history[start..].to_vec()
+    }
+
+    /// Run a manual review on the current conversation history.
+    pub fn run_manual_review(&self) -> Option<anyhow::Result<crate::memory_reviewer::ReviewResult>> {
+        self.memory_reviewer.as_ref().map(|r| {
+            let snapshot = self.build_review_snapshot(r.window_size());
+            r.review_turns(&snapshot)
+        })
+    }
+
+    /// Run a full session-end review on the entire conversation history.
+    pub fn run_session_review(&self) -> Option<anyhow::Result<crate::memory_reviewer::ReviewResult>> {
+        if self.conversation_history.is_empty() {
+            return None;
+        }
+        self.memory_reviewer.as_ref().map(|r| {
+            let all = self.conversation_history.clone();
+            r.review_session(&all)
+        })
     }
 }
 

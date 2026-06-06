@@ -19,6 +19,7 @@ use mini_agent::hooks::HookRunner;
 use mini_agent::identity::{default_identity, Identity};
 use mini_agent::llm::LlmClient;
 use mini_agent::memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
+use mini_agent::memory_reviewer::MemoryReviewer;
 use mini_agent::mcp::{McpClientManager, register_mcp_tools};
 use mini_agent::observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
 use mini_agent::session_search::SessionDB;
@@ -192,15 +193,39 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
 
     // Initialize LLM client
     let client = LlmClient::new(
-        cfg.model.api_key,
-        cfg.model.base_url,
-        cfg.model.model,
+        cfg.model.api_key.clone(),
+        cfg.model.base_url.clone(),
+        cfg.model.model.clone(),
     )
     .with_max_tokens(cfg.model.max_tokens)
     .with_temperature(cfg.model.temperature)
     .with_top_p(cfg.model.top_p)
+    .with_extra_headers(cfg.model.extra_headers.clone())
+    .with_timeout(cfg.model.timeout);
+
+    // Initialize review client (may use cheaper model for cost control)
+    let review_client = LlmClient::new(
+        cfg.model.api_key,
+        cfg.model.base_url,
+        cfg.review.model_override.unwrap_or_else(|| cfg.model.model.clone()),
+    )
+    .with_max_tokens(cfg.review.max_tokens)
+    .with_temperature(0.3)
+    .with_top_p(1.0)  // keep 1.0 for Zhipu compatibility (some providers reject top_p < 1)
     .with_extra_headers(cfg.model.extra_headers)
     .with_timeout(cfg.model.timeout);
+
+    // Initialize memory reviewer
+    let memory_reviewer: Option<Arc<MemoryReviewer>> = if cfg.review.enabled {
+        Some(Arc::new(MemoryReviewer::new(
+            review_client,
+            file_memory.clone(),
+            cfg.review.interval,
+            cfg.review.window_size,
+        )))
+    } else {
+        None
+    };
 
     // Initialize observer (terminal + log combined)
     let observer: Arc<dyn Observer> = if cfg.observer.enabled {
@@ -241,6 +266,7 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
     agent.set_observer(Some(observer));
     agent.set_hooks(hooks.clone());
     agent.set_session_db(session_db.clone());
+    agent.set_memory_reviewer(memory_reviewer.clone());
     agent.emit_session_start();
 
     // Fire session start hooks
@@ -297,10 +323,45 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
                 eprintln!("Error: {}", e);
             }
         }
+
+        // Turn-based background review
+        if let Some(ref reviewer) = memory_reviewer {
+            if reviewer.should_review(agent.turn_count) {
+                let snapshot = agent.build_review_snapshot(reviewer.window_size());
+                let reviewer_clone = reviewer.clone();
+                std::thread::spawn(move || {
+                    match reviewer_clone.review_turns(&snapshot) {
+                        Ok(result) => {
+                            if result.actions_executed > 0 {
+                                log::info!("📝 Background review saved {} memories: {}", result.actions_executed, result.summary);
+                            } else {
+                                log::debug!("Background review: {}", result.summary);
+                            }
+                        }
+                        Err(e) => log::warn!("Background review failed: {}", e),
+                    }
+                });
+            }
+        }
     }
 
     // Cleanup
     println!("\n👋 Goodbye!");
+
+    // Session-end deep review before exit
+    if let Some(result) = agent.run_session_review() {
+        println!("Running session-end review...");
+        match result {
+            Ok(result) => {
+                if result.actions_executed > 0 {
+                    println!("📝 Session review saved {} memories: {}", result.actions_executed, result.summary);
+                } else {
+                    println!("📝 Session review: {}", result.summary);
+                }
+            }
+            Err(e) => println!("⚠️ Session review failed: {}", e),
+        }
+    }
 
     // Fire session end hooks
     hooks.fire_session_end(&agent.session_id).await;
@@ -324,6 +385,7 @@ async fn handle_slash(input: &str, skill_manager: &SkillManager, agent: &mut Age
             println!("  /quit, /q       Exit");
             println!("  /help, /h       Show this help");
             println!("  /new            Start a new session");
+            println!("  /review         Run memory review on current conversation");
             println!("  /skills         List available skills");
             println!("  /memory         Show memory status");
             println!("  /clear          Clear conversation history");
@@ -332,9 +394,36 @@ async fn handle_slash(input: &str, skill_manager: &SkillManager, agent: &mut Age
             println!("Invoke a skill: /skill-name");
         }
         "/new" => {
+            // Session-end review before starting new session
+            if let Some(result) = agent.run_session_review() {
+                println!("Running session-end review...");
+                match result {
+                    Ok(result) => {
+                        if result.actions_executed > 0 {
+                            println!("📝 Session review saved {} memories: {}", result.actions_executed, result.summary);
+                        } else {
+                            println!("📝 Session review: {}", result.summary);
+                        }
+                    }
+                    Err(e) => println!("⚠️ Session review failed: {}", e),
+                }
+            }
             let old_session = agent.session_id[..8].to_string();
             agent.new_session();
             println!("🆕 New session started. Old: {}..., New: {}...", old_session, &agent.session_id[..8]);
+        }
+        "/review" => {
+            match agent.run_manual_review() {
+                Some(Ok(result)) => {
+                    if result.actions_executed > 0 {
+                        println!("📝 Review saved {} memories: {}", result.actions_executed, result.summary);
+                    } else {
+                        println!("📝 Review: {}", result.summary);
+                    }
+                }
+                Some(Err(e)) => eprintln!("Review failed: {}", e),
+                None => println!("Memory reviewer not enabled."),
+            }
         }
         "/skills" => {
             match handle_skills_list(skill_manager) {
@@ -355,7 +444,8 @@ async fn handle_slash(input: &str, skill_manager: &SkillManager, agent: &mut Age
         }
         "/model" => {
             if let Some(model) = parts.get(1) {
-                println!("Model switch not yet implemented. Requested: {}", model);
+                agent.switch_model(model);
+                println!("🔄 Model switched to: {}", model);
             } else {
                 println!("Usage: /model <model-name>");
             }
@@ -835,6 +925,13 @@ fn run_setup_wizard() -> anyhow::Result<()> {
         },
         file_memory: mini_agent::models::FileMemoryConfig::default(),
         compression: mini_agent::models::CompressionConfig::default(),
+        review: mini_agent::models::ReviewConfig {
+            enabled: true,
+            interval: 10,
+            window_size: 8,
+            max_tokens: 4096,
+            model_override: None,
+        },
     };
 
     let config_path = config::get_config_path();

@@ -169,10 +169,9 @@ impl SessionDB {
 
     /// Discovery: FTS5 full-text search across all sessions.
     pub fn discover(&self, query: &str, limit: usize) -> Result<Vec<SessionSearchResult>> {
-        let conn = self.conn.lock().unwrap();
-
         if query.is_empty() {
             // Fall back to recent sessions when no query
+            // NOTE: browse() acquires its own lock; do NOT hold conn here to avoid deadlock
             let summaries = self.browse(limit)?;
             return Ok(summaries
                 .into_iter()
@@ -185,6 +184,8 @@ impl SessionDB {
                 })
                 .collect());
         }
+
+        let conn = self.conn.lock().unwrap();
 
         let mut stmt = conn.prepare(
             "SELECT s.id, s.title, s.started_at, s.message_count,

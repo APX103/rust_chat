@@ -78,6 +78,10 @@ impl LlmClient {
         &self.model
     }
 
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        self.model = model.into();
+    }
+
     pub fn chat(
         &self,
         messages: &[Message],

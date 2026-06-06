@@ -4,3 +4,9 @@ Cargo.lock
 *.db
 *.log
 config.toml
+
+# Privacy data (memory files, session DBs)
+.mini-agent/data/
+
+# IDE / tooling
+.claude/

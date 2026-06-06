@@ -12,6 +12,7 @@ pub mod hooks;
 pub mod identity;
 pub mod llm;
 pub mod memory;
+pub mod memory_reviewer;
 pub mod mcp;
 pub mod models;
 pub mod observer;

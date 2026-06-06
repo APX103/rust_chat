@@ -36,6 +36,13 @@ enabled = false
 interval_secs = 3600   # Run tasks every hour
 tasks = ["auto_summarize", "memory_cleanup"]
 
+[review]
+enabled = true
+interval = 10          # Review every N turns
+window_size = 8        # Review last N messages
+max_tokens = 2048      # Review LLM max_tokens
+# model_override = "glm-4-flash"  # Optional: cheaper model for review
+
 # MCP Servers — tools will be auto-discovered and registered
 [mcp_servers]
 

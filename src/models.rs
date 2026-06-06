@@ -269,6 +269,8 @@ pub struct AgentConfig {
     pub file_memory: FileMemoryConfig,
     #[serde(default)]
     pub compression: CompressionConfig,
+    #[serde(default)]
+    pub review: ReviewConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +341,20 @@ pub struct CompressionConfig {
     pub summary_target_ratio: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    #[serde(default = "default_review_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_review_interval")]
+    pub interval: usize,
+    #[serde(default = "default_review_window_size")]
+    pub window_size: usize,
+    #[serde(default = "default_review_max_tokens")]
+    pub max_tokens: i32,
+    #[serde(default)]
+    pub model_override: Option<String>,
+}
+
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
@@ -347,6 +363,18 @@ impl Default for CompressionConfig {
             protect_first_n: 3,
             protect_last_n: 20,
             summary_target_ratio: 0.20,
+        }
+    }
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval: 10,
+            window_size: 8,
+            max_tokens: 2048,
+            model_override: None,
         }
     }
 }
@@ -530,4 +558,20 @@ fn default_compression_protect_last() -> usize {
 
 fn default_compression_summary_ratio() -> f64 {
     0.20
+}
+
+fn default_review_enabled() -> bool {
+    true
+}
+
+fn default_review_interval() -> usize {
+    10
+}
+
+fn default_review_window_size() -> usize {
+    8
+}
+
+fn default_review_max_tokens() -> i32 {
+    2048
 }
