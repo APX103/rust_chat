@@ -195,20 +195,17 @@ def main():
 
         # 测试 1: 时间
         log("\n测试 1: mcp_time_get_current_time")
-        send_input(master_fd, "现在的时间戳是多少")
+        send_input(master_fd, "现在几点了")
         output = wait_for_pattern(master_fd, r"🧠 You:", timeout=30)
 
         if "mcp_time_get_current_time" in output:
-            ts_match = re.search(r"(当前系统时间戳|时间戳|timestamp).*?(\d{10,})", output, re.S | re.I)
-            if ts_match:
-                ts = int(ts_match.group(2))
-                if 1577836800 < ts < 4102444800:
-                    log(f"PASS: 时间工具调用成功，返回时间戳: {ts}")
-                    passed += 1
-                else:
-                    failed.append("时间戳不在合理范围内")
+            # 校验 LLM 回复中包含当天日期（避免 LLM 胡说）
+            date_match = re.search(r"2026[年/-]0?6[月/-]?0?6", output)
+            if date_match:
+                log(f"PASS: 时间工具调用成功，LLM 说出了正确日期: {date_match.group()}")
+                passed += 1
             else:
-                failed.append("时间工具返回格式不正确")
+                failed.append("LLM 没有说出正确的当前日期")
         else:
             failed.append("时间工具未被调用")
 

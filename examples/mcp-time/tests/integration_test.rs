@@ -125,18 +125,16 @@ fn test_get_current_time() {
     assert_eq!(resp["result"]["isError"].as_bool(), Some(false));
     let text = resp["result"]["content"][0]["text"].as_str().unwrap();
     assert!(
-        text.starts_with("Current UNIX timestamp: "),
+        text.starts_with("Current time: "),
         "unexpected time response: {}",
         text
     );
-    let ts: u64 = text
-        .strip_prefix("Current UNIX timestamp: ")
-        .unwrap()
-        .parse()
-        .expect("timestamp should be numeric");
-    // 基本合理性校验：2020-01-01 到 2100-01-01 之间
-    assert!(ts > 1577836800, "timestamp too old: {}", ts);
-    assert!(ts < 4102444800, "timestamp too far in future: {}", ts);
+    // 校验包含 ISO 8601 格式
+    assert!(
+        text.contains("ISO 8601:"),
+        "response should contain ISO 8601 timestamp: {}",
+        text
+    );
 
     child.kill().ok();
 }

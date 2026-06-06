@@ -22,9 +22,9 @@ TOOLS=$(echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | "$BIN")
 echo "$TOOLS" | jq -e '.jsonrpc == "2.0" and .id == 2 and (.result.tools | length) == 1 and .result.tools[0].name == "get_current_time"' && echo "✅ tools/list 通过"
 
 echo ""
-echo "=== 测试 3: tools/call 返回时间戳 ==="
+echo "=== 测试 3: tools/call 返回格式化时间 ==="
 RESULT=$(printf '%s\n' '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_current_time","arguments":{}}}' | "$BIN")
-echo "$RESULT" | jq -e '.jsonrpc == "2.0" and .id == 3 and .result.isError == false and (.result.content[0].text | startswith("Current UNIX timestamp: "))' && echo "✅ tools/call 通过"
+echo "$RESULT" | jq -e '.jsonrpc == "2.0" and .id == 3 and .result.isError == false and (.result.content[0].text | startswith("Current time: "))' && echo "✅ tools/call 通过"
 echo "$RESULT" | jq '.result.content[0].text'
 
 echo ""

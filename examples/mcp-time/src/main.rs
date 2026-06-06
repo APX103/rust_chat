@@ -1,8 +1,8 @@
 //! 极简 Rust stdio MCP server —— 返回当前时间
-//! 零外部依赖，纯标准库实现 JSON-RPC over stdio
+//! 零外部 JSON-RPC 解析依赖，使用 chrono 提供人类可读时间
 
+use chrono::Local;
 use std::io::{self, BufRead, Write};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn main() {
     let stdin = io::stdin();
@@ -26,16 +26,15 @@ fn main() {
                 respond(&mut stdout, id, r#"{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"time-rs","version":"1.0"}}"#);
             }
             "tools/list" => {
-                respond(&mut stdout, id, r#"{"tools":[{"name":"get_current_time","description":"Return current system time","inputSchema":{"type":"object","properties":{}}}]}"#);
+                respond(&mut stdout, id, r#"{"tools":[{"name":"get_current_time","description":"Return current system time as a formatted string (ISO 8601 with local timezone)","inputSchema":{"type":"object","properties":{}}}]}"#);
             }
             "tools/call" => {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let now = Local::now();
+                let formatted = now.format("%Y-%m-%d %H:%M:%S %:z (%A)").to_string();
+                let iso = now.to_rfc3339();
                 let result = format!(
-                    r#"{{"content":[{{"type":"text","text":"Current UNIX timestamp: {}"}}],"isError":false}}"#,
-                    now
+                    r#"{{"content":[{{"type":"text","text":"Current time: {} (ISO 8601: {})"}}],"isError":false}}"#,
+                    formatted, iso
                 );
                 respond(&mut stdout, id, &result);
             }
