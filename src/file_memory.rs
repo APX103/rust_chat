@@ -5,6 +5,7 @@ use regex::Regex;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -14,13 +15,24 @@ use std::path::{Path, PathBuf};
 pub const ENTRY_DELIMITER: &str = "\n§\n";
 
 /// Regex patterns for prompt injection / data exfiltration detection.
-pub const THREAT_PATTERNS: [&str; 5] = [
+const THREAT_PATTERNS: [&str; 5] = [
     r"(?i)(ignore|disregard|forget)\s+(all\s+)?(previous|above|earlier)\s+(instructions?|commands?|directives?)",
     r"(?i)you\s+are\s+now\s+(a|an|the)\s+\w+",
     r"(?i)(send|reply|forward|email)\s+(to|at)\s+\S+@\S+",
     r"(?i)(output|write|save|dump)\s+(to|into)\s+(file|url|http|ftp)",
     r"(?i)(new|updated|revised)\s+(instructions?|rules?|directives?)\s*:",
 ];
+
+/// Lazily compiled threat regexes — compiled once at first use, never recompiled.
+fn threat_regexes() -> &'static [Regex] {
+    static INSTANCE: OnceLock<Vec<Regex>> = OnceLock::new();
+    INSTANCE.get_or_init(|| {
+        THREAT_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).expect("threat pattern regex is valid at compile time"))
+            .collect()
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,14 +141,7 @@ impl FileMemoryStore {
     /// Scan `content` for prompt-injection / data-exfiltration patterns.
     /// Returns `true` if any threat pattern matches.
     pub fn scan_for_threats(content: &str) -> bool {
-        for pattern in THREAT_PATTERNS.iter() {
-            if let Ok(re) = Regex::new(pattern) {
-                if re.is_match(content) {
-                    return true;
-                }
-            }
-        }
-        false
+        threat_regexes().iter().any(|re| re.is_match(content))
     }
 
     // -----------------------------------------------------------------------
@@ -215,8 +220,17 @@ impl FileMemoryStore {
         // Atomic write: write to temp file, then rename
         let mut tmp_file = File::create(&tmp_path)
             .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
+
+        // Enforce character limit: trim oldest entries to fit
+        let limit = self.limit_for_target(target);
+        let final_content = if new_content.chars().count() > limit {
+            Self::trim_to_fit(&new_content, limit)
+        } else {
+            new_content
+        };
+
         tmp_file
-            .write_all(new_content.as_bytes())
+            .write_all(final_content.as_bytes())
             .with_context(|| format!("writing temp file {}", tmp_path.display()))?;
         tmp_file
             .sync_all()
