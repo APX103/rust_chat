@@ -217,20 +217,30 @@ impl FileMemoryStore {
             format!("{}{}{}", existing, ENTRY_DELIMITER, trimmed)
         };
 
+        // Enforce character limit (Hermes-style: error on overflow, let agent consolidate)
+        let limit = self.limit_for_target(target);
+        let new_len = new_content.chars().count();
+        if new_len > limit {
+            let entries = self.load_entries(target).unwrap_or_default();
+            let usage_pct = (existing.chars().count() as f64 / limit as f64 * 100.0) as usize;
+            return Err(anyhow::anyhow!(
+                "Memory for {:?} is at {}% capacity ({} / {} chars). \
+                 Cannot add entry ({} chars). \
+                 Current entries:\n{}\n\
+                 Hint: use 'replace' to merge or remove old entries before adding new ones.",
+                target, usage_pct, existing.chars().count(), limit, trimmed.chars().count(),
+                entries.iter().enumerate().map(|(i, e)| {
+                    format!("  [{}] {}", i, if e.blocked { "[BLOCKED]" } else { &e.content })
+                }).collect::<Vec<_>>().join("\n")
+            ));
+        }
+
         // Atomic write: write to temp file, then rename
         let mut tmp_file = File::create(&tmp_path)
             .with_context(|| format!("creating temp file {}", tmp_path.display()))?;
 
-        // Enforce character limit: trim oldest entries to fit
-        let limit = self.limit_for_target(target);
-        let final_content = if new_content.chars().count() > limit {
-            Self::trim_to_fit(&new_content, limit)
-        } else {
-            new_content
-        };
-
         tmp_file
-            .write_all(final_content.as_bytes())
+            .write_all(new_content.as_bytes())
             .with_context(|| format!("writing temp file {}", tmp_path.display()))?;
         tmp_file
             .sync_all()
@@ -521,42 +531,30 @@ mod tests {
     }
 
     #[test]
-    fn test_char_limit_trims_oldest() -> anyhow::Result<()> {
+    fn test_char_limit_rejects_overflow() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let memory_path = dir.path().join("MEMORY.md");
         let user_path = dir.path().join("USER.md");
 
-        let store = FileMemoryStore::new(&memory_path, &user_path, 30, 30)?;
+        let store = FileMemoryStore::new(&memory_path, &user_path, 25, 25)?;
 
+        // First entry fits (21 chars < 25)
         store.add(MemoryTarget::Memory, "first very long entry")?;
-        store.add(MemoryTarget::Memory, "second")?;
-        store.add(MemoryTarget::Memory, "third")?;
-
-        // Load raw content and apply trim_to_fit directly
         let raw = fs::read_to_string(&memory_path)?;
-        let trimmed = FileMemoryStore::trim_to_fit(&raw, 30);
+        assert!(raw.contains("first very long entry"));
 
-        // Verify the oldest entry was trimmed
-        assert!(
-            !trimmed.contains("first very long entry"),
-            "oldest entry should have been trimmed, got: {}",
-            trimmed
-        );
-        assert!(
-            trimmed.contains("second"),
-            "should still contain second, got: {}",
-            trimmed
-        );
-        assert!(
-            trimmed.contains("third"),
-            "should still contain third, got: {}",
-            trimmed
-        );
-        assert!(
-            trimmed.len() <= 30,
-            "trimmed content should fit in 30 chars, got {}",
-            trimmed.len()
-        );
+        // Second entry would overflow (21 + 3 + 6 = 30 > 25)
+        // → returns error with consolidation hint
+        let result = store.add(MemoryTarget::Memory, "second");
+        assert!(result.is_err(), "should reject overflow, got: {:?}", result);
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Cannot add entry"), "error should mention capacity: {}", err);
+        assert!(err.contains("use 'replace'"), "error should hint consolidation: {}", err);
+
+        // Original content unchanged (no silent trimming)
+        let raw2 = fs::read_to_string(&memory_path)?;
+        assert!(!raw2.contains("second"), "overflow entry should NOT be written");
+        assert!(raw2.contains("first very long entry"));
 
         Ok(())
     }

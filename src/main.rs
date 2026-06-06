@@ -508,9 +508,21 @@ fn register_builtin_tools(
                 "add" => {
                     let key = args["key"].as_str().unwrap_or("");
                     let value = args["value"].as_str().unwrap_or("");
+                    let content = args["content"].as_str().unwrap_or("");
                     let category = args["category"].as_str();
-                    db_clone.remember(key, value, category)?;
-                    Ok(format!("Remembered: {} = {}", key, value))
+                    // LLM sometimes sends 'content' instead of 'value'; be tolerant
+                    let actual_value = if !value.is_empty() { value } else { content };
+                    let actual_key = if !key.is_empty() {
+                        key.to_string()
+                    } else {
+                        // Derive key from first few words of value/content
+                        actual_value.split_whitespace().take(3).collect::<Vec<_>>().join("_")
+                    };
+                    if actual_key.is_empty() || actual_value.is_empty() {
+                        return Ok("Error: 'add' requires content or (key + value).".to_string());
+                    }
+                    db_clone.remember(&actual_key, actual_value, category)?;
+                    Ok(format!("Remembered: {} = {}", actual_key, actual_value))
                 }
                 "recall" => {
                     let query = args["query"].as_str().unwrap_or("");

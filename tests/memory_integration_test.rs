@@ -108,13 +108,22 @@ mod memory_integration_test {
 
         let store = FileMemoryStore::new(&mem_path, &user_path, 50, 50).unwrap();
 
-        // Add entries that exceed limit
+        // First two entries fit (22 + 3 + 24 = 49 < 50)
         store.add(MemoryTarget::Memory, "First entry about Rust").unwrap();
         store.add(MemoryTarget::Memory, "Second entry about async").unwrap();
-        store.add(MemoryTarget::Memory, "Third entry about tokio").unwrap();
 
-        // Verify total is within limit
+        // Third entry would overflow → rejected with consolidation hint
+        let result = store.add(MemoryTarget::Memory, "Third entry about tokio");
+        assert!(result.is_err(), "should reject overflow");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Cannot add entry"));
+        assert!(err.contains("use 'replace'"));
+
+        // Verify file content is within limit and first two entries preserved
         let content = std::fs::read_to_string(&mem_path).unwrap();
         assert!(content.chars().count() <= 50, "Content {} exceeds limit", content.chars().count());
+        assert!(content.contains("First entry about Rust"));
+        assert!(content.contains("Second entry about async"));
+        assert!(!content.contains("Third entry about tokio"), "overflow entry should not be written");
     }
 }

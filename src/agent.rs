@@ -86,6 +86,8 @@ impl Agent {
         max_context_tokens: usize,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
+        // Freeze initial memory snapshot (Hermes-style: session-start load, then frozen)
+        memory.freeze("system_prompt", &session_id);
         Self {
             client,
             registry,
@@ -159,6 +161,15 @@ impl Agent {
 
         if messages.is_empty() && !self.system_prompt.is_empty() {
             messages.push(Message::system(&self.system_prompt));
+        }
+
+        // Correction Detection (Hermes-style): if user is correcting us,
+        // inject a hint so the model updates memory proactively.
+        if Self::detect_correction(user_message) {
+            messages.push(Message::system(
+                "The user is correcting you. Update your memory immediately \
+                 to reflect the correction so you don't make the same mistake again."
+            ));
         }
 
         // Add user message
@@ -519,6 +530,9 @@ impl Agent {
         self.iteration_budget = IterationBudget::new(self.iteration_budget.max_total);
         self.budget_grace_call = false;
 
+        // Freeze new memory snapshot for this session (Hermes-style)
+        self.memory.freeze("system_prompt", &self.session_id);
+
         // Start new session
         if let Some(ref db) = self.session_db {
             let _ = db.upsert_session(&self.session_id, None);
@@ -528,6 +542,18 @@ impl Agent {
     }
 
     /// Build a snapshot of recent conversation turns for review.
+    /// Detect if the user message contains a correction signal.
+    /// Inspired by Hermes Agent's correction detection.
+    fn detect_correction(msg: &str) -> bool {
+        let lower = msg.to_lowercase();
+        let signals = [
+            "不对", "错了", "应该是", "不是", "而是", "更正", "纠正",
+            "别", "不要", "不是", "不对", "错了", "error", "wrong",
+            "should be", "not", "instead", "correction", "实际上",
+        ];
+        signals.iter().any(|s| lower.contains(s))
+    }
+
     pub fn build_review_snapshot(&self, window_size: usize) -> Vec<Message> {
         let start = self.conversation_history.len().saturating_sub(window_size);
         self.conversation_history[start..].to_vec()

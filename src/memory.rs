@@ -26,9 +26,18 @@ pub trait MemoryProvider: Send + Sync {
 }
 
 /// MemoryManager orchestrates multiple memory providers.
+///
+/// Implements the Frozen Snapshot pattern inspired by Hermes Agent:
+/// - At session start, memory is loaded once and cached.
+/// - During the session, prefetch_all returns the cached snapshot.
+/// - Writes still go to disk/DB immediately, but the model's "mind"
+///   doesn't change mid-session. This preserves LLM prefix cache and
+///   prevents the model from chasing its own tail.
 pub struct MemoryManager {
     providers: Vec<Arc<dyn MemoryProvider>>,
     file_memory: Option<Arc<FileMemoryStore>>,
+    /// Cached snapshot for the current session. None = not frozen yet.
+    frozen_snapshot: Mutex<Option<String>>,
 }
 
 impl MemoryManager {
@@ -36,6 +45,7 @@ impl MemoryManager {
         Self {
             providers: vec![],
             file_memory: None,
+            frozen_snapshot: Mutex::new(None),
         }
     }
 
@@ -49,7 +59,30 @@ impl MemoryManager {
         self.providers.push(provider);
     }
 
+    /// Freeze the current memory state into a snapshot for this session.
+    /// Call this once at session start. After freezing, prefetch_all
+    /// returns the cached snapshot instead of re-reading from disk/DB.
+    pub fn freeze(&self, query: &str, session_id: &str) {
+        let snapshot = self.build_snapshot(query, session_id);
+        *self.frozen_snapshot.lock().unwrap() = Some(snapshot);
+        log::info!("Memory snapshot frozen for session {}", session_id);
+    }
+
+    /// Thaw (clear) the frozen snapshot. Call this at session end.
+    pub fn thaw(&self) {
+        *self.frozen_snapshot.lock().unwrap() = None;
+        log::info!("Memory snapshot thawed");
+    }
+
+    /// Returns the frozen snapshot if available, otherwise builds fresh.
     pub fn prefetch_all(&self, query: &str, session_id: &str) -> String {
+        if let Some(ref snapshot) = *self.frozen_snapshot.lock().unwrap() {
+            return snapshot.clone();
+        }
+        self.build_snapshot(query, session_id)
+    }
+
+    fn build_snapshot(&self, query: &str, session_id: &str) -> String {
         let mut parts = vec![];
 
         // File memory snapshot
@@ -65,7 +98,7 @@ impl MemoryManager {
             }
         }
 
-        // Existing provider loop...
+        // Provider loop
         for provider in &self.providers {
             match provider.prefetch(query, session_id) {
                 Ok(ctx) if !ctx.trim().is_empty() => {
@@ -93,6 +126,7 @@ impl MemoryManager {
     }
 
     pub fn on_session_end(&self, session_id: &str) {
+        self.thaw();
         for provider in &self.providers {
             if let Err(e) = provider.on_session_end(session_id) {
                 log::warn!("Provider {} session end failed: {}", provider.name(), e);
@@ -253,18 +287,20 @@ impl SqliteMemory {
         )?;
         
         // Sync FTS5 index
+        // Note: FTS5 virtual tables do not support UPSERT (ON CONFLICT DO UPDATE).
+        // We must DELETE then INSERT for updates.
         let id: i64 = conn.query_row(
             "SELECT id FROM semantic_memory WHERE key = ?1",
             params![key],
             |row| row.get(0),
         )?;
         conn.execute(
+            "DELETE FROM semantic_memory_fts WHERE rowid = ?1",
+            params![id],
+        )?;
+        conn.execute(
             "INSERT INTO semantic_memory_fts(rowid, key, value, category)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(rowid) DO UPDATE SET
-                 key = excluded.key,
-                 value = excluded.value,
-                 category = excluded.category",
+             VALUES (?1, ?2, ?3, ?4)",
             params![id, key, value, cat],
         )?;
         
