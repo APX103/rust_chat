@@ -11,6 +11,7 @@
 
 mod agent;
 mod config;
+mod file_memory;
 mod heartbeat;
 mod hooks;
 mod identity;

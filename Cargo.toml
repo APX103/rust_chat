@@ -62,3 +62,6 @@ crossbeam-channel = "0.5"
 # Logging (minimal)
 log = "0.4"
 env_logger = "0.11"
+
+# Temp directories for tests
+tempfile = "3"
