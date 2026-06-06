@@ -10,6 +10,7 @@
 //! Target: ARM64 (Cortex-A57) + Debian 7 (static musl build)
 
 mod agent;
+mod compression;
 mod config;
 mod file_memory;
 mod heartbeat;
