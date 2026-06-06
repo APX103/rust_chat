@@ -20,6 +20,7 @@ mod memory;
 mod mcp;
 mod models;
 mod observer;
+mod session_search;
 mod skill;
 mod tool;
 mod tool_registry;
@@ -34,6 +35,7 @@ use memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
 use mcp::{McpClientManager, register_mcp_tools};
 use crate::file_memory::{FileMemoryStore, MemoryTarget};
 use observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
+use session_search::SessionDB;
 use skill::{SkillManager, get_skill_tools, handle_skill_manage, handle_skill_view, handle_skills_list};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -164,8 +166,20 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
     // Initialize tool registry
     let registry = Arc::new(ToolRegistry::new());
 
+    // Initialize session search DB
+    let session_db: Option<Arc<SessionDB>> = {
+        let session_db_path = config::get_data_dir().join("sessions.db");
+        match SessionDB::new(&session_db_path) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(e) => {
+                log::warn!("Failed to initialize session search: {}", e);
+                None
+            }
+        }
+    };
+
     // Register built-in memory tools
-    register_builtin_tools(&registry, sqlite_memory.clone(), skill_manager.clone(), Some(file_memory.clone()));
+    register_builtin_tools(&registry, sqlite_memory.clone(), skill_manager.clone(), Some(file_memory.clone()), session_db.clone());
 
     // Register skill management tools
     register_skill_tools(&registry, skill_manager.clone());
@@ -386,6 +400,7 @@ fn register_builtin_tools(
     db: Arc<SqliteMemory>,
     _skill_manager: Arc<SkillManager>,
     file_memory: Option<Arc<FileMemoryStore>>,
+    session_db: Option<Arc<SessionDB>>,
 ) {
     let db_clone = db.clone();
     let file_memory_clone = file_memory.clone();
@@ -471,6 +486,80 @@ fn register_builtin_tools(
                     }
                 }
                 _ => Err(anyhow::anyhow!("Unknown memory action: {}", action))
+            }
+        }),
+        crate::models::ToolSource::Builtin,
+    );
+
+    // session_search tool
+    let session_db_clone = session_db.clone();
+    registry.register_tool_legacy(
+        crate::models::ToolSchema {
+            name: "session_search".to_string(),
+            description: "Search past conversation sessions for relevant context.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "mode": { "type": "string", "enum": ["discover", "scroll", "browse"] },
+                    "query": { "type": "string", "description": "Search query (for discover mode)" },
+                    "session_id": { "type": "string" },
+                    "message_id": { "type": "integer" },
+                    "limit": { "type": "integer", "default": 10 }
+                },
+                "required": []
+            }),
+        },
+        Arc::new(move |_name: &str, args: &serde_json::Value| {
+            let mode = args["mode"].as_str().unwrap_or("browse");
+            let db = match session_db_clone.as_ref() {
+                Some(db) => db,
+                None => return Ok("Session search is not enabled.".to_string()),
+            };
+
+            match mode {
+                "discover" => {
+                    let query = args["query"].as_str().unwrap_or("");
+                    let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+                    let results = db.discover(query, limit)?;
+                    if results.is_empty() {
+                        Ok("No matching sessions found.".to_string())
+                    } else {
+                        let lines: Vec<String> = results.iter()
+                            .map(|r| format!("- [{}] {} ({} msgs): {}",
+                                &r.session_id[..8], r.title.as_deref().unwrap_or("untitled"), r.message_count, r.snippet))
+                            .collect();
+                        Ok(format!("Found {} sessions:\n{}", results.len(), lines.join("\n")))
+                    }
+                }
+                "scroll" => {
+                    let session_id = args["session_id"].as_str().unwrap_or("");
+                    let message_id = args["message_id"].as_i64();
+                    let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+                    let msgs = db.scroll(session_id, message_id, limit)?;
+                    if msgs.is_empty() {
+                        Ok("No messages found.".to_string())
+                    } else {
+                        let lines: Vec<String> = msgs.iter()
+                            .map(|m| format!("[{}] {}: {}",
+                                m.role, &m.timestamp[..19], m.content.as_deref().unwrap_or("")))
+                            .collect();
+                        Ok(lines.join("\n"))
+                    }
+                }
+                "browse" => {
+                    let limit = args["limit"].as_u64().unwrap_or(10) as usize;
+                    let sessions = db.browse(limit)?;
+                    if sessions.is_empty() {
+                        Ok("No sessions recorded yet.".to_string())
+                    } else {
+                        let lines: Vec<String> = sessions.iter()
+                            .map(|s| format!("- [{}] {} ({} msgs) — {}",
+                                &s.id[..8], s.title.as_deref().unwrap_or("untitled"), s.message_count, s.started_at))
+                            .collect();
+                        Ok(format!("Recent sessions:\n{}", lines.join("\n")))
+                    }
+                }
+                _ => Ok("Unknown mode. Use discover, scroll, or browse.".to_string()),
             }
         }),
         crate::models::ToolSource::Builtin,
