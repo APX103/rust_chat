@@ -7,6 +7,7 @@
 //! - Procedural Memory: Skill usage patterns and tool preferences
 
 use anyhow::{Context, Result};
+use crate::file_memory::{FileMemoryStore, MemoryTarget};
 use chrono::Utc;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -27,11 +28,20 @@ pub trait MemoryProvider: Send + Sync {
 /// MemoryManager orchestrates multiple memory providers.
 pub struct MemoryManager {
     providers: Vec<Arc<dyn MemoryProvider>>,
+    file_memory: Option<Arc<FileMemoryStore>>,
 }
 
 impl MemoryManager {
     pub fn new() -> Self {
-        Self { providers: vec![] }
+        Self {
+            providers: vec![],
+            file_memory: None,
+        }
+    }
+
+    pub fn with_file_memory(mut self, store: Arc<FileMemoryStore>) -> Self {
+        self.file_memory = Some(store);
+        self
     }
 
     pub fn add_provider(&mut self, provider: Arc<dyn MemoryProvider>) {
@@ -41,6 +51,21 @@ impl MemoryManager {
 
     pub fn prefetch_all(&self, query: &str, session_id: &str) -> String {
         let mut parts = vec![];
+
+        // File memory snapshot
+        if let Some(ref fm) = self.file_memory {
+            let mem_snapshot = fm.snapshot(MemoryTarget::Memory).unwrap_or_default();
+            let user_snapshot = fm.snapshot(MemoryTarget::User).unwrap_or_default();
+
+            if !mem_snapshot.is_empty() {
+                parts.push(format!("## Agent Memory\n{}", mem_snapshot));
+            }
+            if !user_snapshot.is_empty() {
+                parts.push(format!("## User Profile\n{}", user_snapshot));
+            }
+        }
+
+        // Existing provider loop...
         for provider in &self.providers {
             match provider.prefetch(query, session_id) {
                 Ok(ctx) if !ctx.trim().is_empty() => {

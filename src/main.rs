@@ -32,6 +32,7 @@ use identity::{default_identity, Identity};
 use llm::LlmClient;
 use memory::{BuiltinMemoryProvider, MemoryManager, SqliteMemory};
 use mcp::{McpClientManager, register_mcp_tools};
+use crate::file_memory::{FileMemoryStore, MemoryTarget};
 use observer::{Event, LogObserver, MultiObserver, NoopObserver, Observer};
 use skill::{SkillManager, get_skill_tools, handle_skill_manage, handle_skill_view, handle_skills_list};
 use std::io::{self, Write};
@@ -137,8 +138,17 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
     let sqlite_memory = Arc::new(SqliteMemory::new(&db_path)?);
     sqlite_memory.set_session_id("default");
 
-    // Initialize memory manager with builtin provider
-    let mut memory_manager = MemoryManager::new();
+    // Initialize file memory store
+    let file_memory = Arc::new(FileMemoryStore::new(
+        get_data_dir().join("MEMORY.md"),
+        get_data_dir().join("USER.md"),
+        cfg.file_memory.memory_char_limit,
+        cfg.file_memory.user_char_limit,
+    )?);
+
+    // Initialize memory manager with builtin provider + file memory
+    let mut memory_manager = MemoryManager::new()
+        .with_file_memory(file_memory.clone());
     let builtin_memory = Arc::new(BuiltinMemoryProvider::new(
         sqlite_memory.clone(),
         cfg.memory.semantic_search_top_k,
@@ -155,7 +165,7 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
     let registry = Arc::new(ToolRegistry::new());
 
     // Register built-in memory tools
-    register_builtin_tools(&registry, sqlite_memory.clone(), skill_manager.clone());
+    register_builtin_tools(&registry, sqlite_memory.clone(), skill_manager.clone(), Some(file_memory.clone()));
 
     // Register skill management tools
     register_skill_tools(&registry, skill_manager.clone());
@@ -375,8 +385,10 @@ fn register_builtin_tools(
     registry: &ToolRegistry,
     db: Arc<SqliteMemory>,
     _skill_manager: Arc<SkillManager>,
+    file_memory: Option<Arc<FileMemoryStore>>,
 ) {
     let db_clone = db.clone();
+    let file_memory_clone = file_memory.clone();
     registry.register_tool_legacy(
         crate::models::ToolSchema {
             name: "memory".to_string(),
@@ -384,11 +396,14 @@ fn register_builtin_tools(
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["add", "recall", "profile_set", "profile_get"] },
+                    "action": { "type": "string", "enum": ["add", "recall", "profile_set", "profile_get", "replace", "remove"] },
+                    "target": { "type": "string", "enum": ["memory", "user"], "description": "Target file (memory=MEMORY.md, user=USER.md)" },
                     "key": { "type": "string" },
                     "value": { "type": "string" },
                     "category": { "type": "string" },
-                    "query": { "type": "string" }
+                    "query": { "type": "string" },
+                    "old_text": { "type": "string", "description": "Text to find for replace/remove" },
+                    "content": { "type": "string", "description": "New content for replace" }
                 },
                 "required": ["action"]
             }),
@@ -426,6 +441,33 @@ fn register_builtin_tools(
                     match db_clone.get_profile(key)? {
                         Some((v, c)) => Ok(format!("{} = {} (confidence: {:.0}%)", key, v, c * 100.0)),
                         None => Ok(format!("No profile entry for '{}'", key)),
+                    }
+                }
+                "replace" => {
+                    let target_str = args["target"].as_str().unwrap_or("memory");
+                    let old_text = args["old_text"].as_str().unwrap_or("");
+                    let new_content = args["content"].as_str().unwrap_or("");
+                    let target = MemoryTarget::from_str(target_str).unwrap_or(MemoryTarget::Memory);
+                    match file_memory_clone.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("File memory not available"))?
+                        .replace(target, old_text, new_content)
+                    {
+                        Ok(true) => Ok("Entry replaced successfully.".to_string()),
+                        Ok(false) => Ok("No matching entry found to replace.".to_string()),
+                        Err(e) => Err(e),
+                    }
+                }
+                "remove" => {
+                    let target_str = args["target"].as_str().unwrap_or("memory");
+                    let old_text = args["old_text"].as_str().unwrap_or("");
+                    let target = MemoryTarget::from_str(target_str).unwrap_or(MemoryTarget::Memory);
+                    match file_memory_clone.as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("File memory not available"))?
+                        .remove(target, old_text)
+                    {
+                        Ok(true) => Ok("Entry removed successfully.".to_string()),
+                        Ok(false) => Ok("No matching entry found to remove.".to_string()),
+                        Err(e) => Err(e),
                     }
                 }
                 _ => Err(anyhow::anyhow!("Unknown memory action: {}", action))

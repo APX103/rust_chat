@@ -63,8 +63,8 @@ impl MemoryTarget {
 
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
-            "MEMORY.md" => Some(MemoryTarget::Memory),
-            "USER.md" => Some(MemoryTarget::User),
+            "MEMORY.md" | "memory" => Some(MemoryTarget::Memory),
+            "USER.md" | "user" => Some(MemoryTarget::User),
             _ => None,
         }
     }
