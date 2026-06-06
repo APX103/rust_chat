@@ -249,10 +249,13 @@ async fn run(config_override: Option<String>) -> anyhow::Result<()> {
         memory_manager.clone(),
         skill_manager.clone(),
         cfg.agent.max_iterations,
+        cfg.compression.enabled,
+        cfg.model.max_tokens as usize,
     );
     agent.set_system_prompt(system_prompt);
     agent.set_observer(Some(observer));
     agent.set_hooks(hooks.clone());
+    agent.set_session_db(session_db.clone());
     agent.emit_session_start();
 
     // Fire session start hooks

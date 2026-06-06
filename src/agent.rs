@@ -13,6 +13,7 @@ use crate::llm::{LlmClient, Usage};
 use crate::memory::{build_memory_context_block, MemoryManager};
 use crate::models::{Message, MessageRole, ToolCall, ToolSchema};
 use crate::observer::{Event, Observer, Timer};
+use crate::session_search::SessionDB;
 use crate::skill::SkillManager;
 use crate::tool_registry::ToolRegistry;
 use crate::tool::ToolOutput;
@@ -34,6 +35,9 @@ pub struct Agent {
     pub api_call_count: usize,
     pub iteration_budget: IterationBudget,
     pub budget_grace_call: bool,
+    compression_enabled: bool,
+    max_context_tokens: usize,
+    session_db: Option<Arc<SessionDB>>,
     observer: Option<Arc<dyn Observer>>,
     on_token: Option<Mutex<Box<dyn FnMut(&str) + Send>>>,
     hooks: Arc<HookRunner>,
@@ -76,6 +80,8 @@ impl Agent {
         memory: Arc<MemoryManager>,
         skill_manager: Arc<SkillManager>,
         max_iterations: usize,
+        compression_enabled: bool,
+        max_context_tokens: usize,
     ) -> Self {
         let session_id = Uuid::new_v4().to_string();
         Self {
@@ -91,6 +97,9 @@ impl Agent {
             api_call_count: 0,
             iteration_budget: IterationBudget::new(max_iterations),
             budget_grace_call: false,
+            compression_enabled,
+            max_context_tokens,
+            session_db: None,
             observer: None,
             on_token: None,
             hooks: Arc::new(HookRunner::new()),
@@ -112,6 +121,10 @@ impl Agent {
 
     pub fn set_on_token(&mut self, f: impl FnMut(&str) + Send + 'static) {
         self.on_token = Some(Mutex::new(Box::new(f)));
+    }
+
+    pub fn set_session_db(&mut self, db: Option<Arc<SessionDB>>) {
+        self.session_db = db;
     }
 
     fn emit(&self, event: Event) {
@@ -358,6 +371,14 @@ impl Agent {
                 }
             }
 
+            // Check context size for potential compression
+            if self.compression_enabled {
+                let context_tokens = Self::estimate_context_tokens(&messages);
+                if context_tokens > (self.max_context_tokens as f64 * 0.5) as usize {
+                    log::warn!("Context approaching limit ({} tokens), consider /compress", context_tokens);
+                }
+            }
+
             // No tool calls — final response
             final_response = assistant_msg.content.clone().unwrap_or_default();
 
@@ -377,6 +398,19 @@ impl Agent {
 
         // Sync memory
         self.memory.sync_all(user_message, &final_response, &self.session_id);
+
+        // Store messages to session_db for long-term recall
+        if let Some(ref db) = self.session_db {
+            let user_content = user_message;
+            let assistant_content = &final_response;
+            if let Err(e) = db.store_message(&self.session_id, "user", Some(user_content), None, None) {
+                log::debug!("Failed to store user message: {}", e);
+            }
+            if let Err(e) = db.store_message(&self.session_id, "assistant", Some(assistant_content), None, None) {
+                log::debug!("Failed to store assistant message: {}", e);
+            }
+        }
+
         self.turn_count += 1;
 
         // Save conversation history (limit to last 50 messages to prevent bloat)
@@ -431,6 +465,12 @@ impl Agent {
         self.registry.dispatch(name, args).await
     }
 
+    fn estimate_context_tokens(messages: &[Message]) -> usize {
+        messages.iter().map(|m| {
+            m.content.as_deref().unwrap_or("").chars().count() / 4
+        }).sum()
+    }
+
     pub async fn chat(&mut self, message: &str) -> Result<String> {
         self.run_conversation(message).await
     }
@@ -449,6 +489,11 @@ impl Agent {
 
     /// Start a new session: end current one, reset state, emit start.
     pub fn new_session(&mut self) {
+        // End old session
+        if let Some(ref db) = self.session_db {
+            let _ = db.end_session(&self.session_id);
+        }
+
         self.emit_session_end();
         self.memory.on_session_end(&self.session_id);
 
@@ -458,6 +503,11 @@ impl Agent {
         self.api_call_count = 0;
         self.iteration_budget = IterationBudget::new(self.iteration_budget.max_total);
         self.budget_grace_call = false;
+
+        // Start new session
+        if let Some(ref db) = self.session_db {
+            let _ = db.upsert_session(&self.session_id, None);
+        }
 
         self.emit_session_start();
     }
